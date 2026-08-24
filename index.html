@@ -921,13 +921,13 @@ function renderStock() {
       <div class="low-strip-title font-mono">${ICONS.alert(13)}<span>ใกล้หมด (รวมทั้งสองที่)</span></div>
       <div class="low-chips">
         ${lowItems.map(it => `
-          <button class="low-chip" data-edit="${it.id}">
+          <div class="low-chip" data-edit="${it.id}" role="button" tabindex="0">
             <div class="name">${esc(it.name)}</div>
             <div class="row">
               <div class="qty font-mono">${totalQty(it)} ${esc(it.unit)}</div>
-              ${(it.supplierPhone || it.supplierLine || it.supplierLink) ? ICONS.phone(12) : ''}
+              ${(it.supplierPhone || it.supplierLine || it.supplierLink) ? `<button type="button" class="icon" style="background:none; border:none; padding:0; color:var(--red); cursor:pointer;" data-contact="${it.id}" aria-label="ติดต่อผู้จัดจำหน่าย">${ICONS.phone(12)}</button>` : ''}
             </div>
-          </button>
+          </div>
         `).join('')}
       </div>`;
   }
