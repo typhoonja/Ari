@@ -1382,6 +1382,11 @@ document.getElementById('fab').addEventListener('click', () => {
 
 /* ---------- Event delegation for list / table clicks ---------- */
 document.body.addEventListener('click', (e) => {
+  // check data-contact BEFORE data-edit: the contact icon sits inside the
+  // item-info block (which carries data-edit), so it must win when tapped directly
+  const contactTarget = e.target.closest('[data-contact]');
+  if (contactTarget) { contactSupplier(contactTarget.getAttribute('data-contact')); return; }
+
   const editTarget = e.target.closest('[data-edit]');
   if (editTarget) { openModal(editTarget.getAttribute('data-edit')); return; }
 
@@ -1396,9 +1401,6 @@ document.body.addEventListener('click', (e) => {
 
   const transferTarget = e.target.closest('[data-transfer]');
   if (transferTarget) { openTransferModal(transferTarget.getAttribute('data-transfer')); return; }
-
-  const contactTarget = e.target.closest('[data-contact]');
-  if (contactTarget) { contactSupplier(contactTarget.getAttribute('data-contact')); return; }
 
   const staffEditTarget = e.target.closest('[data-staff-edit]');
   if (staffEditTarget) { openStaffModal(staffEditTarget.getAttribute('data-staff-edit')); return; }
