@@ -419,6 +419,11 @@
       <input id="fMinQty" class="amber-border" inputmode="numeric" pattern="[0-9]*" />
     </div>
 
+    <div class="field mono">
+      <label class="line-label"></label>
+      <input id="fFrontTarget" inputmode="numeric" pattern="[0-9]*" placeholder="เว้นว่าง = ใช้ค่าขั้นต่ำแทน" />
+    </div>
+
     <div class="divider-block">
       <div class="section-label"></div>
       <div class="field">
@@ -798,6 +803,7 @@ document.getElementById('closeReportModal').innerHTML = ICONS.x();
 document.getElementById('mondayBannerClose').innerHTML = ICONS.x(16);
 document.querySelector('#tfQty').previousElementSibling.innerHTML = ICONS.swap(12) + ' จำนวนที่จะย้าย';
 document.querySelector('#fMinQty').previousElementSibling.innerHTML = ICONS.alert(12) + ' แจ้งเตือนเมื่อรวมเหลือน้อยกว่า';
+document.querySelector('#fFrontTarget').previousElementSibling.innerHTML = ICONS.store(12) + ' จำนวนที่หน้าร้านควรมี (เป้าหมาย)';
 document.querySelector('.section-label').innerHTML = ICONS.store(12) + ' ผู้จัดจำหน่าย (ไว้สั่งของ)';
 document.querySelector('#fSupplierLine').previousElementSibling.innerHTML = ICONS.chat(11) + ' LINE (ลิงก์ หรือ LINE ID)';
 document.querySelector('#fSupplierLink').previousElementSibling.innerHTML = ICONS.link(11) + ' ลิงก์สั่งของ (Shopee ฯลฯ)';
@@ -846,8 +852,10 @@ function itemCardHtml(it, locKey, locCode) {
   const total = totalQty(it);
   const isLow = total <= it.minQty; // red: even the warehouse can't cover it — need to order
   const locQty = it[locKey] || 0;
-  // yellow: only the store front is low, but the warehouse still has stock to move over
-  const isFrontWarn = !isLow && locCode === 'Front' && locQty <= it.minQty && (it.qtyBack || 0) > 0;
+  // the target the store front should be stocked to; falls back to minQty if not set separately
+  const frontTarget = (it.frontTarget !== undefined && it.frontTarget !== null) ? it.frontTarget : it.minQty;
+  // yellow: only the store front is below its own target, but the warehouse still has stock to move over
+  const isFrontWarn = !isLow && locCode === 'Front' && locQty < frontTarget && (it.qtyBack || 0) > 0;
   const stateClass = isLow ? 'low' : (isFrontWarn ? 'warn' : '');
 
   let alertBtn = '';
@@ -859,19 +867,19 @@ function itemCardHtml(it, locKey, locCode) {
 
   let stateNote = '';
   if (isLow) stateNote = ' · ใกล้หมด (คลังก็ไม่พอ)';
-  else if (isFrontWarn) stateNote = ' · หน้าร้านใกล้หมด มีของในคลัง';
+  else if (isFrontWarn) stateNote = ` · หน้าร้านต่ำกว่าเป้า ${frontTarget} มีของในคลัง`;
 
   return `
       <div class="item-card ${stateClass}">
         <div class="item-top">
-          <button class="item-info" data-edit="${it.id}">
+          <div class="item-info" data-edit="${it.id}" role="button" tabindex="0">
             <div class="item-name-row">
               <span class="item-name">${esc(it.name)}</span>
               ${alertBtn}
             </div>
             <div class="item-min font-mono ${stateClass}">ขั้นต่ำ ${it.minQty} ${esc(it.unit)} · รวมทั้งหมด ${total}${stateNote}</div>
             ${it.supplierName ? `<div class="item-supplier">${ICONS.store(11)}<span>${esc(it.supplierName)}</span></div>` : ''}
-          </button>
+          </div>
           <div class="item-actions">
             ${it.supplierPhone ? `<a class="icon-btn call" href="tel:${esc(it.supplierPhone)}" aria-label="โทรสั่งของ">${ICONS.phone()}</a>` : ''}
             ${it.supplierLine ? `<a class="icon-btn line" href="${esc(buildLineHref(it.supplierLine))}" target="_blank" rel="noopener noreferrer" aria-label="เปิด LINE">${ICONS.chat()}</a>` : ''}
@@ -890,7 +898,11 @@ function renderStock() {
 
   const lowItems = items.filter(it => totalQty(it) <= it.minQty);
   const warnItems = activeTab === 'store'
-    ? items.filter(it => totalQty(it) > it.minQty && (it.qtyFront || 0) <= it.minQty && (it.qtyBack || 0) > 0)
+    ? items.filter(it => {
+        if (totalQty(it) <= it.minQty) return false;
+        const target = (it.frontTarget !== undefined && it.frontTarget !== null) ? it.frontTarget : it.minQty;
+        return (it.qtyFront || 0) < target && (it.qtyBack || 0) > 0;
+      })
     : [];
   document.getElementById('subtitle').textContent = activeTab === 'store'
     ? `หน้าร้าน · ${items.length} รายการ`
@@ -1067,6 +1079,7 @@ function openModal(id) {
   document.getElementById('fQtyBack').value = it ? String(it.qtyBack || 0) : '0';
   document.getElementById('fUnit').value = it?.unit || 'ชิ้น';
   document.getElementById('fMinQty').value = it ? String(it.minQty) : '5';
+  document.getElementById('fFrontTarget').value = (it && it.frontTarget !== undefined && it.frontTarget !== null) ? String(it.frontTarget) : '';
   document.getElementById('fSupplierName').value = it?.supplierName || '';
   document.getElementById('fSupplierPhone').value = it?.supplierPhone || '';
   document.getElementById('fSupplierLine').value = it?.supplierLine || '';
@@ -1096,6 +1109,8 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   const qtyFront = Math.max(0, parseInt(document.getElementById('fQtyFront').value, 10) || 0);
   const qtyBack = Math.max(0, parseInt(document.getElementById('fQtyBack').value, 10) || 0);
   const minQty = Math.max(0, parseInt(document.getElementById('fMinQty').value, 10) || 0);
+  const frontTargetRaw = document.getElementById('fFrontTarget').value.trim();
+  const frontTarget = frontTargetRaw === '' ? null : Math.max(0, parseInt(frontTargetRaw, 10) || 0);
   const unit = document.getElementById('fUnit').value.trim() || 'ชิ้น';
   const supplierName = document.getElementById('fSupplierName').value.trim();
   const supplierPhone = document.getElementById('fSupplierPhone').value.trim();
@@ -1104,9 +1119,9 @@ document.getElementById('saveBtn').addEventListener('click', () => {
 
   if (editingId) {
     const it = items.find(x => x.id === editingId);
-    Object.assign(it, { name, category: itemEditCat, qtyFront, qtyBack, minQty, unit, supplierName, supplierPhone, supplierLine, supplierLink });
+    Object.assign(it, { name, category: itemEditCat, qtyFront, qtyBack, minQty, frontTarget, unit, supplierName, supplierPhone, supplierLine, supplierLink });
   } else {
-    items.push({ id: uid(), name, category: itemEditCat, qtyFront, qtyBack, minQty, unit, supplierName, supplierPhone, supplierLine, supplierLink });
+    items.push({ id: uid(), name, category: itemEditCat, qtyFront, qtyBack, minQty, frontTarget, unit, supplierName, supplierPhone, supplierLine, supplierLink });
     showToast(`เพิ่ม "${name}" แล้ว`);
   }
   saveItems(items);
@@ -1114,7 +1129,7 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   render();
 });
 
-['fQtyFront','fQtyBack','fMinQty'].forEach(id => {
+['fQtyFront','fQtyBack','fMinQty','fFrontTarget'].forEach(id => {
   document.getElementById(id).addEventListener('input', e => {
     e.target.value = e.target.value.replace(/[^0-9]/g, '');
   });
@@ -1231,8 +1246,9 @@ function openTransferModal(id) {
   transferItemId = id;
   transferDirection = 'toFront';
   document.getElementById('transferModalTitle').textContent = `ย้ายสินค้า · ${it.name}`;
-  // suggest just enough to bring the store front back up to its minimum, capped by what's in the warehouse
-  const needed = Math.max(0, it.minQty - (it.qtyFront || 0));
+  // suggest just enough to bring the store front up to its target (or minimum, if no target set), capped by what's in the warehouse
+  const target = (it.frontTarget !== undefined && it.frontTarget !== null) ? it.frontTarget : it.minQty;
+  const needed = Math.max(0, target - (it.qtyFront || 0));
   const suggested = needed > 0 ? Math.min(needed, it.qtyBack || 0) : 0;
   document.getElementById('tfQty').value = suggested > 0 ? String(suggested) : '';
   updateTransferCurrentQty();
