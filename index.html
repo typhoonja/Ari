@@ -298,6 +298,7 @@
   .btn-delete{width:48px; height:48px; flex-shrink:0; border-radius:12px; background:var(--coral-bg); color:var(--coral); border:none; display:flex; align-items:center; justify-content:center; cursor:pointer;}
   .btn-save{flex:1; height:48px; border-radius:12px; background:var(--teal-strong); color:#122320; font-size:15px; font-weight:600; border:none; cursor:pointer;}
   .btn-save:disabled{opacity:.4;}
+  .btn-qr{width:48px; height:48px; flex-shrink:0; border-radius:12px; background:var(--amber-bg); color:var(--amber); border:none; font-family:'IBM Plex Mono',monospace; font-weight:700; font-size:12px; cursor:pointer;}
   #mondayBanner{
     display:none; align-items:center; gap:10px; margin:12px 20px 0;
     background:var(--coral-bg); border:1px solid var(--amber-border); border-radius:14px;
@@ -325,6 +326,7 @@
     </div>
     <div style="display:flex; align-items:center; gap:8px;">
       <div id="lowBadgeWrap"></div>
+      <button class="icon-btn" id="catQrBtn" style="background:var(--bg-alt); color:var(--text-dim); width:40px; height:40px;" aria-label="QR ตามหมวดหมู่"></button>
       <button class="icon-btn" id="reportBtn" style="background:var(--bg-alt); color:var(--text-dim); width:40px; height:40px;" aria-label="รายงานผงมัทฉะ"></button>
     </div>
   </div>
@@ -333,6 +335,7 @@
     <span class="icon" id="searchIcon"></span>
     <input id="search" placeholder="ค้นหาสินค้า…" />
   </div>
+  <div id="catFilterBadge" style="display:none; margin-top:10px; align-items:center; gap:8px;"></div>
 </header>
 
 <div id="mondayBanner">
@@ -446,8 +449,42 @@
 
     <div class="modal-actions">
       <button class="btn-delete" id="deleteBtn" style="display:none;"></button>
+      <button class="btn-qr" id="qrBtn" style="display:none;">QR</button>
       <button class="btn-save" id="saveBtn">บันทึก</button>
     </div>
+  </div>
+</div>
+
+<div class="overlay" id="qrOverlay">
+  <div class="modal" style="text-align:center;">
+    <div class="modal-head">
+      <h2 class="font-display" id="qrModalTitle">QR สินค้า</h2>
+      <button class="close-btn" id="closeQrModal"></button>
+    </div>
+    <p style="font-size:13px; color:var(--text-dim); margin:0 0 16px;">สแกนแล้วเปิดตรงไปที่สินค้านี้ในแอป — ปริ้นแปะไว้ตรงจุดหยิบของได้เลย</p>
+    <img id="qrImg" src="" alt="QR code" style="width:220px; height:220px; border-radius:12px; border:1px solid var(--card-border); background:#fff;" />
+    <div style="margin-top:14px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--text-faint); word-break:break-all;" id="qrLinkText"></div>
+    <div class="modal-actions">
+      <button class="btn-save" id="qrCopyBtn" style="width:100%;">คัดลอกลิงก์</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="catQrOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 class="font-display">QR ตามหมวดหมู่</h2>
+      <button class="close-btn" id="closeCatQrModal"></button>
+    </div>
+    <p style="font-size:13px; color:var(--text-dim); margin:0 0 16px;">เลือกแท็บและหมวดหมู่ที่จะสร้าง QR — สแกนแล้วเปิดตรงไปที่รายการกรองไว้ให้เลย เหมาะกับแปะไว้ที่ชั้นวางแยกโซน</p>
+    <div class="field" style="margin-bottom:16px;">
+      <label>ตำแหน่ง</label>
+      <div class="cat-picker" id="catQrTabPicker">
+        <button type="button" class="cat-pill" data-cat-qr-tab="store">หน้าร้าน</button>
+        <button type="button" class="cat-pill" data-cat-qr-tab="stock">คลัง/หลังร้าน</button>
+      </div>
+    </div>
+    <div class="field" style="margin-bottom:0;" id="catQrList"></div>
   </div>
 </div>
 
@@ -563,6 +600,7 @@ const ICONS = {
   users: (s=20,c='currentColor') => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
   swap: (s=18,c='currentColor') => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 2v16"/><path d="M3 6l4-4 4 4"/><path d="M17 22V6"/><path d="M21 18l-4 4-4-4"/></svg>`,
   list: (s=18,c='currentColor') => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>`,
+  qr: (s=18,c='currentColor') => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM20 14v3M14 20h3M20 20v.01"/></svg>`,
 };
 
 /* ---------- Storage: items ---------- */
@@ -704,6 +742,7 @@ let log = loadLog();
 let staffList = loadStaff();
 let rosterMeta = loadRosterMeta();
 let query = '';
+let categoryFilter = null; // null = all, or one of ITEM_CATEGORIES keys
 let editingId = null;       // item being edited (null = adding new)
 let itemEditCat = 'other';  // category picker state for item modal
 let editingStaffId = null;  // staff being edited (null = adding new)
@@ -799,6 +838,9 @@ document.getElementById('staffDeleteBtn').innerHTML = ICONS.trash();
 document.getElementById('closeDayModal').innerHTML = ICONS.x();
 document.getElementById('closeTransferModal').innerHTML = ICONS.x();
 document.getElementById('reportBtn').innerHTML = ICONS.list(18);
+document.getElementById('catQrBtn').innerHTML = ICONS.qr(18);
+document.getElementById('closeCatQrModal').innerHTML = ICONS.x();
+document.getElementById('closeQrModal').innerHTML = ICONS.x();
 document.getElementById('closeReportModal').innerHTML = ICONS.x();
 document.getElementById('mondayBannerClose').innerHTML = ICONS.x(16);
 document.querySelector('#tfQty').previousElementSibling.innerHTML = ICONS.swap(12) + ' จำนวนที่จะย้าย';
@@ -908,6 +950,20 @@ function renderStock() {
     ? `หน้าร้าน · ${items.length} รายการ`
     : `คลัง/หลังร้าน · ${items.length} รายการ`;
 
+  const filterBadge = document.getElementById('catFilterBadge');
+  if (categoryFilter) {
+    const catLabel = (ITEM_CATEGORIES.find(c => c.key === categoryFilter) || {}).label || categoryFilter;
+    filterBadge.style.display = 'flex';
+    filterBadge.innerHTML = `
+      <span style="font-size:12px; font-family:'IBM Plex Mono',monospace; background:var(--teal-bg); color:var(--teal); padding:6px 10px; border-radius:999px;">กำลังกรอง: ${esc(catLabel)}</span>
+      <button type="button" id="clearCatFilterBtn" style="font-size:12px; color:var(--text-dim); background:none; border:none; cursor:pointer; text-decoration:underline;">ล้างตัวกรอง</button>
+    `;
+    document.getElementById('clearCatFilterBtn').addEventListener('click', () => { categoryFilter = null; render(); });
+  } else {
+    filterBadge.style.display = 'none';
+    filterBadge.innerHTML = '';
+  }
+
   const badgeWrap = document.getElementById('lowBadgeWrap');
   badgeWrap.innerHTML = `
       ${lowItems.length ? `<div class="low-badge">${ICONS.alert(15)}<span class="font-mono">${lowItems.length}</span></div>` : ''}
@@ -947,7 +1003,9 @@ function renderStock() {
   }
   stripEl.innerHTML = stripHtml;
 
-  const filtered = items.filter(it => it.name.toLowerCase().includes(query.trim().toLowerCase()));
+  const filtered = items
+    .filter(it => it.name.toLowerCase().includes(query.trim().toLowerCase()))
+    .filter(it => !categoryFilter || (it.category || 'other') === categoryFilter);
   const listEl = document.getElementById('list');
   if (filtered.length === 0) {
     listEl.innerHTML = `<div class="empty">
@@ -1085,9 +1143,122 @@ function openModal(id) {
   document.getElementById('fSupplierLine').value = it?.supplierLine || '';
   document.getElementById('fSupplierLink').value = it?.supplierLink || '';
   document.getElementById('deleteBtn').style.display = it ? 'flex' : 'none';
+  document.getElementById('qrBtn').style.display = it ? 'flex' : 'none';
   overlay.classList.add('open');
 }
 function closeModal() { overlay.classList.remove('open'); editingId = null; }
+
+/* ---------- QR deep link for an item ---------- */
+function itemDeepLink(id, tab) {
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('tab', tab || activeTab || 'stock');
+  url.searchParams.set('item', id);
+  return url.toString();
+}
+function openQRModal(id) {
+  const it = items.find(x => x.id === id);
+  if (!it) return;
+  const link = itemDeepLink(id);
+  document.getElementById('qrModalTitle').textContent = `QR · ${it.name}`;
+  document.getElementById('qrLinkText').textContent = link;
+  document.getElementById('qrImg').src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`;
+  document.getElementById('qrOverlay').classList.add('open');
+}
+function closeQRModal() { document.getElementById('qrOverlay').classList.remove('open'); }
+document.getElementById('qrBtn').addEventListener('click', () => { if (editingId) openQRModal(editingId); });
+document.getElementById('closeQrModal').addEventListener('click', closeQRModal);
+document.getElementById('qrCopyBtn').addEventListener('click', () => {
+  const link = document.getElementById('qrLinkText').textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(link).then(() => showToast('คัดลอกลิงก์แล้ว')).catch(() => showToast('คัดลอกไม่สำเร็จ'));
+  } else {
+    showToast('คัดลอกไม่สำเร็จ (เบราว์เซอร์ไม่รองรับ)');
+  }
+});
+
+/* ---------- QR by category (e.g. Ingredients / Packing shelf signs) ---------- */
+let catQrTab = 'stock';
+function categoryDeepLink(catKey, tab) {
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('tab', tab || 'stock');
+  url.searchParams.set('cat', catKey);
+  return url.toString();
+}
+function renderCatQrTabPicker() {
+  document.querySelectorAll('#catQrTabPicker [data-cat-qr-tab]').forEach(b => {
+    b.classList.toggle('selected', b.getAttribute('data-cat-qr-tab') === catQrTab);
+  });
+}
+function renderCatQrList() {
+  const wrap = document.getElementById('catQrList');
+  wrap.innerHTML = ITEM_CATEGORIES.filter(c => c.key !== 'other').map(c => `
+    <button type="button" class="btn-save" style="width:100%; margin-bottom:10px; background:var(--amber-bg); color:var(--amber);" data-gen-cat-qr="${c.key}">สร้าง QR · ${esc(c.label)}</button>
+  `).join('');
+}
+function openCatQRModal() {
+  renderCatQrTabPicker();
+  renderCatQrList();
+  document.getElementById('catQrOverlay').classList.add('open');
+}
+function closeCatQRModal() { document.getElementById('catQrOverlay').classList.remove('open'); }
+document.getElementById('catQrBtn').addEventListener('click', openCatQRModal);
+document.getElementById('closeCatQrModal').addEventListener('click', closeCatQRModal);
+document.getElementById('catQrTabPicker').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-cat-qr-tab]');
+  if (!btn) return;
+  catQrTab = btn.getAttribute('data-cat-qr-tab');
+  renderCatQrTabPicker();
+});
+document.getElementById('catQrList').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-gen-cat-qr]');
+  if (!btn) return;
+  const catKey = btn.getAttribute('data-gen-cat-qr');
+  const catLabel = (ITEM_CATEGORIES.find(c => c.key === catKey) || {}).label || catKey;
+  const link = categoryDeepLink(catKey, catQrTab);
+  document.getElementById('qrModalTitle').textContent = `QR · หมวด ${catLabel}`;
+  document.getElementById('qrLinkText').textContent = link;
+  document.getElementById('qrImg').src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`;
+  closeCatQRModal();
+  document.getElementById('qrOverlay').classList.add('open');
+});
+
+
+/* ---------- Deep link from URL (for QR codes): ?tab=stock&item=ID&open=transfer / &q=search ---------- */
+function applyDeepLinkFromURL(retry) {
+  const params = new URLSearchParams(window.location.search);
+  const tab = params.get('tab');
+  const q = params.get('q');
+  const itemId = params.get('item');
+  const openWhat = params.get('open');
+  const cat = params.get('cat');
+
+  if (tab && ['store', 'stock', 'staff'].includes(tab)) setTab(tab);
+  if (cat) {
+    categoryFilter = cat;
+    render();
+  }
+  if (q !== null) {
+    query = q;
+    document.getElementById('search').value = q;
+    render();
+  }
+  if (itemId) {
+    const it = items.find(x => x.id === itemId);
+    if (it) {
+      if (openWhat === 'transfer') openTransferModal(itemId);
+      else openModal(itemId);
+    } else if (!retry) {
+      // items may still be loading from cloud sync — try again shortly
+      setTimeout(() => applyDeepLinkFromURL(true), 1200);
+    } else {
+      showToast('ไม่พบสินค้าตาม QR นี้ (อาจถูกลบหรือยังไม่ซิงก์)');
+    }
+  }
+}
 
 document.getElementById('closeModal').addEventListener('click', closeModal);
 
@@ -1420,6 +1591,7 @@ document.getElementById('search').addEventListener('input', (e) => {
 setTab('store');
 initCloudSync();
 checkMondayBanner();
+applyDeepLinkFromURL();
 </script>
 </body>
 </html>
