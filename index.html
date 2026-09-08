@@ -99,7 +99,7 @@
   }
   .header-row{display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; flex-wrap:wrap; gap:10px;}
   h1{font-size:22px; font-weight:700; margin:0; letter-spacing:.04em; text-transform:uppercase;}
-  .app-title-img{ height:22px; width:auto; display:block; }
+  .app-title-img{ height:34px; width:auto; display:block; margin-top:10px; }
   .subtitle{font-size:11px; color:var(--text-faint); margin:2px 0 0; letter-spacing:0.05em;}
   .back-home-link{
     display:block; background:none; border:none; padding:0; margin:0 0 6px;
@@ -1460,9 +1460,7 @@ function renderStock() {
         return (it.qtyFront || 0) < target && (it.qtyBack || 0) > 0;
       })
     : [];
-  document.getElementById('subtitle').textContent = activeTab === 'store'
-    ? `หน้าร้าน · ${items.length} รายการ`
-    : `คลัง/หลังร้าน · ${items.length} รายการ`;
+  document.getElementById('subtitle').textContent = `${items.length} รายการ`;
 
   const filterBadge = document.getElementById('catFilterBadge');
   if (categoryFilter || groupFilter) {
@@ -2255,23 +2253,18 @@ document.getElementById('transferSaveBtn').addEventListener('click', () => {
 
 /* ---------- Report: matcha powder stock ---------- */
 const reportOverlay = document.getElementById('reportOverlay');
-function reportLineFor(name) {
-  const it = items.find(x => x.name.trim() === name.trim());
-  if (!it) return { it: null, text: `${name}: ยังไม่มีในระบบ` };
-  return { it, text: `${it.name}: ${totalQty(it)}` };
+function teaPowderItems() {
+  return items.filter(it => (it.category || 'other') === 'tea-powder').sort((a, b) => a.name.localeCompare(b.name));
 }
 function renderReportList() {
   const wrap = document.getElementById('reportList');
-  wrap.innerHTML = REPORT_ITEMS.map(name => {
-    const { it } = reportLineFor(name);
-    if (!it) {
-      return `<div class="report-row"><span class="report-name">${esc(name)}</span><span class="report-missing">ยังไม่มีในระบบ</span></div>`;
-    }
-    return `<div class="report-row">
-      <span class="report-name">${esc(it.name)}</span>
-      <span class="report-qty-plain">${totalQty(it)}</span>
-    </div>`;
-  }).join('');
+  const list = teaPowderItems();
+  wrap.innerHTML = list.length
+    ? list.map(it => `<div class="report-row">
+        <span class="report-name">${esc(it.name)}</span>
+        <span class="report-qty-plain">${totalQty(it)}</span>
+      </div>`).join('')
+    : `<div class="report-row"><span class="report-missing">ยังไม่มีสินค้าในหมวดผงชา</span></div>`;
   document.getElementById('reportDate').textContent =
     'Date  ' + new Date().toLocaleDateString('en-US', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' });
 }
@@ -2280,7 +2273,7 @@ function closeReportModal() { reportOverlay.classList.remove('open'); openHome()
 document.getElementById('closeReportModal').addEventListener('click', closeReportModal);
 document.getElementById('reportCopyBtn').addEventListener('click', () => {
   const text = `Matcha report (${new Date().toLocaleDateString('en-US', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })})\n` +
-    REPORT_ITEMS.map(name => reportLineFor(name).text).join('\n');
+    teaPowderItems().map(it => `${it.name}: ${totalQty(it)}`).join('\n');
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(() => showToast('คัดลอกรายงานแล้ว')).catch(() => showToast('คัดลอกไม่สำเร็จ'));
   } else {
