@@ -845,6 +845,16 @@
   </div>
 </div>
 
+<div class="overlay" id="qrFocusOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 class="font-display" id="qrFocusTitle">รายการ</h2>
+      <button class="close-btn" id="closeQrFocusModal"></button>
+    </div>
+    <div id="qrFocusList"></div>
+  </div>
+</div>
+
 <div class="overlay" id="staffNameOverlay">
   <div class="modal">
     <div class="modal-head">
@@ -1965,14 +1975,8 @@ function applyDeepLinkFromURL(retry) {
   if (tab || cat || group || itemId || q !== null) closeHome(); // arriving via a QR/deep link skips the cover page
 
   if (tab && ['store', 'stock', 'staff'].includes(tab)) setTab(tab);
-  if (cat) {
-    categoryFilter = cat;
-    render();
-  }
-  if (group) {
-    groupFilter = group;
-    render();
-  }
+  if (cat) openQrFocusView('cat', cat, tab);
+  if (group) openQrFocusView('group', group, tab);
   if (q !== null) {
     query = q;
     document.getElementById('search').value = q;
@@ -1991,6 +1995,41 @@ function applyDeepLinkFromURL(retry) {
     }
   }
 }
+
+/* Focused pop-up for QR codes: scanning a category/group QR shows just that
+   list on its own, instead of filtering inside the full Store/Stock page. */
+function openQrFocusView(kind, value, tab) {
+  const locCode = tab === 'stock' ? 'Back' : 'Front';
+  const locKey = locCode === 'Back' ? 'qtyBack' : 'qtyFront';
+
+  let title = 'รายการ';
+  let list = [];
+  if (kind === 'cat') {
+    const c = ITEM_CATEGORIES.find(x => x.key === value);
+    title = c ? c.label : value;
+    list = items.filter(it => (it.category || 'other') === value);
+  } else if (kind === 'group') {
+    const g = customGroups.find(x => x.id === value);
+    if (!g) {
+      // customGroups may still be loading from cloud — try again shortly
+      setTimeout(() => openQrFocusView(kind, value, tab), 1200);
+      return;
+    }
+    title = g.name;
+    const ids = new Set(g.itemIds || []);
+    list = items.filter(it => ids.has(it.id));
+  }
+
+  document.getElementById('qrFocusTitle').textContent = title;
+  const listEl = document.getElementById('qrFocusList');
+  listEl.innerHTML = list.length
+    ? list.map(it => itemCardHtml(it, locKey, locCode)).join('')
+    : '<div class="empty">ไม่พบสินค้าในรายการนี้</div>';
+  document.getElementById('qrFocusOverlay').classList.add('open');
+}
+document.getElementById('closeQrFocusModal').addEventListener('click', () => {
+  document.getElementById('qrFocusOverlay').classList.remove('open');
+});
 
 document.getElementById('closeModal').addEventListener('click', closeModal);
 
