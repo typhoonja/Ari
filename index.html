@@ -2886,6 +2886,18 @@ homeScreen.addEventListener('click', (e) => {
 document.getElementById('appTitle').src = document.getElementById('homeLogoImg').src;
 document.getElementById('appTitle').addEventListener('click', openHome);
 
+/* Tap the dimmed backdrop of any popup to close it — every .overlay wraps
+   its content in a .modal, and clicking outside that .modal (directly on
+   the backdrop) triggers the popup's own close button, so it reuses
+   whatever cleanup that popup's close function already does. */
+document.querySelectorAll('.overlay').forEach(ov => {
+  ov.addEventListener('click', (e) => {
+    if (e.target !== ov) return;
+    const btn = ov.querySelector('.close-btn');
+    if (btn) btn.click();
+  });
+});
+
 setTab('store');
 initCloudSync();
 checkMondayBanner();
