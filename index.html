@@ -894,6 +894,13 @@
 
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+<!-- Builds the range-report PDF directly (works in the Add-to-Home-Screen
+     app too, where window.print() has no browser chrome to open a print
+     sheet from and silently does nothing). html2canvas renders the report
+     with the page's own fonts first (so Thai text comes out correctly),
+     then jsPDF places that image into a real, downloadable PDF file. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
 /* ---------- Icons (inline SVG, no external deps) ---------- */
 const ICONS = {
@@ -1128,6 +1135,8 @@ let activityColRef = null;
 let feedbackColRef = null;
 let cloudPushTimer = null;
 let applyingCloudSnapshot = false;
+let cloudPushInFlight = false;
+let cloudPushQueued = false;
 
 function setCloudStatus(state, label) {
   const el = document.getElementById('cloudStatus');
@@ -1135,6 +1144,71 @@ function setCloudStatus(state, label) {
   el.classList.remove('online', 'offline');
   if (state) el.classList.add(state);
   el.querySelector('.label').textContent = label;
+}
+
+/* Every record we sync (item / staff / group) gets an updatedAt stamp the
+   moment it's touched, so a merge can tell which copy — this device's or
+   another device's — is actually newer, instead of just trusting whichever
+   push happened to land last (which is what caused newly-added items to
+   get silently wiped out by a second, slightly-stale device). */
+function touch(obj) { obj.updatedAt = Date.now(); return obj; }
+
+/* Deleting something on one device must not let another device's
+   still-open, slightly-stale copy silently bring it back on its next
+   save. Each device keeps a short-lived "I deleted this" tombstone list,
+   shared through the cloud doc, so every merge knows to leave it deleted. */
+const TOMBSTONE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+function loadTombstones(key) {
+  try { return JSON.parse(localStorage.getItem(key)) || []; } catch(e) { return []; }
+}
+function pruneTombstones(list) {
+  const cutoff = Date.now() - TOMBSTONE_MAX_AGE_MS;
+  const seen = new Map();
+  (list || []).forEach(t => {
+    if (!t || !t.id || t.deletedAt < cutoff) return;
+    const existing = seen.get(t.id);
+    if (!existing || t.deletedAt > existing.deletedAt) seen.set(t.id, t);
+  });
+  return Array.from(seen.values());
+}
+function recordTombstone(key, id) {
+  const list = pruneTombstones([...loadTombstones(key), { id, deletedAt: Date.now() }]);
+  localStorage.setItem(key, JSON.stringify(list));
+  return list;
+}
+function mergeTombstones(localList, serverList) {
+  return pruneTombstones([...(localList || []), ...(serverList || [])]);
+}
+const DELETED_ITEM_IDS_KEY = 'matcha-deleted-item-ids';
+const DELETED_STAFF_IDS_KEY = 'matcha-deleted-staff-ids';
+const DELETED_GROUP_IDS_KEY = 'matcha-deleted-group-ids';
+
+/* Merge two copies of a collection (this device's in-memory copy, and
+   whatever's actually on the server right now) record-by-record instead of
+   letting one whole array clobber the other. For each id: if it's been
+   deleted anywhere, it stays deleted; otherwise the copy with the newer
+   updatedAt wins. This is what stops "add an item on one device, it
+   vanishes the next time another device saves something". */
+function mergeCollection(localArr, serverArr, tombstoneIds) {
+  const dead = new Set((tombstoneIds || []).map(t => t.id));
+  const byId = new Map();
+  (serverArr || []).forEach(r => { if (r && r.id) byId.set(r.id, r); });
+  (localArr || []).forEach(r => {
+    if (!r || !r.id) return;
+    const existing = byId.get(r.id);
+    if (!existing || (r.updatedAt || 0) >= (existing.updatedAt || 0)) byId.set(r.id, r);
+  });
+  dead.forEach(id => byId.delete(id));
+  return Array.from(byId.values());
+}
+/* The recent-activity log has no delete/edit UI — entries only ever get
+   added — so merging it is just: combine, de-dupe by id, keep the newest 40. */
+function mergeLog(localArr, serverArr) {
+  const byId = new Map();
+  [...(serverArr || []), ...(localArr || [])].forEach(e => { if (e && e.id) byId.set(e.id, e); });
+  return Array.from(byId.values())
+    .sort((a, b) => new Date(b.time) - new Date(a.time))
+    .slice(0, 40);
 }
 
 function applyCloudSnapshot(data) {
@@ -1148,15 +1222,64 @@ function applyCloudSnapshot(data) {
   render();
 }
 
-function pushToCloud() {
+async function pushToCloud() {
   if (!cloudDocRef) return;
-  cloudDocRef.set({
-    items, log: log.slice(0, 40), staffList, rosterMeta, customGroups,
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-  }).catch(err => {
+  if (cloudPushInFlight) { cloudPushQueued = true; return; }
+  cloudPushInFlight = true;
+  try {
+    // Read the true, current server copy right before writing — not a
+    // locally-cached snapshot — so we merge against whatever the *other*
+    // device most recently saved, even if that happened moments ago.
+    let serverData = {};
+    try {
+      const snap = await cloudDocRef.get({ source: 'server' });
+      serverData = snap.exists ? (snap.data() || {}) : {};
+    } catch (e) {
+      const cached = await cloudDocRef.get().catch(() => null);
+      serverData = (cached && cached.exists) ? (cached.data() || {}) : {};
+    }
+
+    const mergedDeletedItems = mergeTombstones(loadTombstones(DELETED_ITEM_IDS_KEY), serverData.deletedItemIds);
+    const mergedDeletedStaff = mergeTombstones(loadTombstones(DELETED_STAFF_IDS_KEY), serverData.deletedStaffIds);
+    const mergedDeletedGroups = mergeTombstones(loadTombstones(DELETED_GROUP_IDS_KEY), serverData.deletedGroupIds);
+    localStorage.setItem(DELETED_ITEM_IDS_KEY, JSON.stringify(mergedDeletedItems));
+    localStorage.setItem(DELETED_STAFF_IDS_KEY, JSON.stringify(mergedDeletedStaff));
+    localStorage.setItem(DELETED_GROUP_IDS_KEY, JSON.stringify(mergedDeletedGroups));
+
+    // Adopt the merged result locally too, so this device immediately sees
+    // anything the other device had that we didn't — no waiting on the
+    // realtime listener to bounce it back to us.
+    items = mergeCollection(items, serverData.items, mergedDeletedItems);
+    staffList = mergeCollection(staffList, serverData.staffList, mergedDeletedStaff);
+    customGroups = mergeCollection(customGroups, serverData.customGroups, mergedDeletedGroups);
+    log = mergeLog(log, serverData.log);
+    // rosterMeta is a single settings object, not a list — whichever side
+    // touched it more recently wins as a whole.
+    if (serverData.rosterMeta && (serverData.rosterMeta.updatedAt || 0) > (rosterMeta.updatedAt || 0)) {
+      rosterMeta = serverData.rosterMeta;
+    }
+    localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
+    localStorage.setItem(STAFF_KEY, JSON.stringify(staffList));
+    localStorage.setItem(CUSTOM_GROUPS_KEY, JSON.stringify(customGroups));
+    localStorage.setItem(LOG_KEY, JSON.stringify(log));
+    localStorage.setItem(ROSTER_META_KEY, JSON.stringify(rosterMeta));
+
+    await cloudDocRef.set({
+      items, log, staffList, rosterMeta, customGroups,
+      deletedItemIds: mergedDeletedItems, deletedStaffIds: mergedDeletedStaff, deletedGroupIds: mergedDeletedGroups,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    applyingCloudSnapshot = true; // we already applied this exact merged state above
+    render();
+    applyingCloudSnapshot = false;
+    setCloudStatus('online', 'ออนไลน์ · ซิงก์ข้ามเครื่องแล้ว');
+  } catch (err) {
     console.warn('cloud push failed', err);
     setCloudStatus('offline', 'ออฟไลน์ · บันทึกในเครื่องนี้เท่านั้น');
-  });
+  } finally {
+    cloudPushInFlight = false;
+    if (cloudPushQueued) { cloudPushQueued = false; pushToCloud(); }
+  }
 }
 
 function queueCloudPush() {
@@ -1178,8 +1301,11 @@ function initCloudSync() {
     feedbackColRef = cloudDocRef.collection('feedback');
     cloudDocRef.onSnapshot((snap) => {
       if (snap.exists) {
-        applyCloudSnapshot(snap.data() || {});
+        // if a merge-push is mid-flight, its result already reflects the
+        // latest state — applying this snapshot on top could clobber it
+        if (!cloudPushInFlight) applyCloudSnapshot(snap.data() || {});
         backfillActivityIfNeeded(snap.data() || {});
+        dedupeActivityArchiveIfNeeded(snap.data() || {});
         reclassifyCategoriesIfNeeded(snap.data() || {});
       } else {
         // very first time ever: no shared data yet, push what we have (seeded defaults) so it becomes the shared copy
@@ -1199,7 +1325,12 @@ function initCloudSync() {
 /* ---------- Activity archive (unbounded history, for date-range reports) ----------
    The `log` array above only keeps the most recent 40 entries (by design, to keep
    the main sync document small). Every new entry is *also* written here, one
-   document per entry, so date-range reports can look back further than 40 actions. */
+   document per entry, so date-range reports can look back further than 40 actions.
+   Each write uses the entry's own id as the Firestore document id (instead of an
+   auto-generated one) so writing the same entry twice — e.g. two devices both
+   running the one-time backfill below around the same time — overwrites the same
+   document instead of creating a duplicate. Duplicates here previously inflated
+   date-range report totals, since the report sums every matching document. */
 let archiveBackfillDone = false;
 function archiveActivity(entry, it) {
   if (!activityColRef) return; // offline: entry stays in the recent-40 log only
@@ -1215,7 +1346,7 @@ function archiveActivity(entry, it) {
     staffName: entry.staffName || null,
     ts: new Date(entry.time).getTime()
   };
-  activityColRef.add(record).catch(err => console.warn('archive activity failed', err));
+  activityColRef.doc(entry.id).set(record).catch(err => console.warn('archive activity failed', err));
 }
 function backfillActivityIfNeeded(cloudData) {
   if (archiveBackfillDone || cloudData.activityBackfilled || !activityColRef) return;
@@ -1225,7 +1356,7 @@ function backfillActivityIfNeeded(cloudData) {
   const batch = firebase.firestore().batch();
   existingLog.forEach(entry => {
     const it = items.find(x => x.id === entry.itemId);
-    const ref = activityColRef.doc();
+    const ref = entry.id ? activityColRef.doc(entry.id) : activityColRef.doc();
     batch.set(ref, {
       itemId: entry.itemId,
       itemName: it ? it.name : entry.name,
@@ -1240,6 +1371,40 @@ function backfillActivityIfNeeded(cloudData) {
   });
   batch.set(cloudDocRef, { activityBackfilled: true }, { merge: true });
   batch.commit().catch(err => console.warn('activity backfill failed', err));
+}
+
+/* One-time cleanup for duplicates written before the fix above: two devices
+   racing the old (non-deterministic-id) backfill could each write a full
+   duplicate copy of the archive, which silently doubled every date-range
+   report total. This groups existing documents by item + exact timestamp
+   (effectively unique per real action) and deletes the extras, keeping one. */
+let activityDedupeDone = false;
+async function dedupeActivityArchiveIfNeeded(cloudData) {
+  if (activityDedupeDone || cloudData.activityDeduped || !activityColRef) return;
+  activityDedupeDone = true;
+  try {
+    const snap = await activityColRef.get();
+    const seen = new Map();
+    const toDelete = [];
+    snap.docs.forEach(d => {
+      const data = d.data();
+      const key = `${data.itemId || ''}|${data.time || ''}|${data.delta}`;
+      if (seen.has(key)) toDelete.push(d.ref); else seen.set(key, d.ref);
+    });
+    if (toDelete.length > 0) {
+      const db = firebase.firestore();
+      for (let i = 0; i < toDelete.length; i += 400) {
+        const batch = db.batch();
+        toDelete.slice(i, i + 400).forEach(ref => batch.delete(ref));
+        await batch.commit();
+      }
+      console.warn(`removed ${toDelete.length} duplicate activity record(s)`);
+    }
+    await cloudDocRef.set({ activityDeduped: true }, { merge: true });
+  } catch (err) {
+    console.warn('activity dedupe failed', err);
+    activityDedupeDone = false; // allow retry on a later snapshot
+  }
 }
 
 /* One-time re-sort into the exact 5 groups given on 2026-09-07 (M001–M005),
@@ -1275,6 +1440,7 @@ function openRangeReportModal() {
 }
 function closeRangeReportModal() { rangeReportOverlay.classList.remove('open'); openHome(); }
 
+let lastRangeReport = null; // { fromStr, toStr, summary } — kept for Export PDF
 async function loadRangeReport() {
   const contentEl = document.getElementById('rrContent');
   const fromStr = document.getElementById('rrFrom').value;
@@ -1330,17 +1496,315 @@ async function loadRangeReport() {
     <div class="rr-summary-title">สรุปตามสินค้า (${Object.keys(summary).length} รายการ)</div>
     ${summaryHtml}
   `;
+  lastRangeReport = { fromStr, toStr, summary };
 }
 
 document.getElementById('closeRangeReportModal').addEventListener('click', closeRangeReportModal);
 document.getElementById('rrLoadBtn').addEventListener('click', loadRangeReport);
-document.getElementById('rrExportBtn').addEventListener('click', () => {
-  if (!document.getElementById('rrContent').querySelector('.rr-summary-row, .rr-detail-row')) {
+/* ---------- Formal PDF export (native text, not a screenshot) ----------
+   jsPDF's built-in fonts have no Thai glyphs, so we fetch a Thai font
+   (Sarabun — the typeface Thailand's own Government Gazette uses for
+   official documents) and embed it directly in the PDF. Because Thai
+   item names are often mixed with Latin/digits in the same string (e.g.
+   "ผงมัทฉะ 1kg"), and the Thai-only subset font has no Latin/digit
+   glyphs, drawMixedText() below splits each string into Thai and
+   non-Thai runs and renders each run in the right font, side by side. */
+let sarabunRegularB64 = null;
+let sarabunBoldB64 = null;
+async function loadSarabunFontData() {
+  if (sarabunRegularB64 && sarabunBoldB64) return;
+  const toBase64 = (buf) => {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  };
+  const base = 'https://cdn.jsdelivr.net/fontsource/fonts/sarabun@5.3.0';
+  const fetchTtf = async (url) => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('font fetch failed: ' + url);
+    return r.arrayBuffer();
+  };
+  const [reg, bold] = await Promise.all([
+    fetchTtf(`${base}/thai-400-normal.ttf`),
+    fetchTtf(`${base}/thai-700-normal.ttf`),
+  ]);
+  sarabunRegularB64 = toBase64(reg);
+  sarabunBoldB64 = toBase64(bold);
+}
+function registerSarabunFont(doc) {
+  doc.addFileToVFS('Sarabun-Regular.ttf', sarabunRegularB64);
+  doc.addFont('Sarabun-Regular.ttf', 'SarabunThai', 'normal');
+  doc.addFileToVFS('Sarabun-Bold.ttf', sarabunBoldB64);
+  doc.addFont('Sarabun-Bold.ttf', 'SarabunThai', 'bold');
+}
+const THAI_CHAR_RE = /[\u0E00-\u0E7F]/;
+function splitMixedRuns(text) {
+  const runs = [];
+  let cur = '', curThai = null;
+  for (const ch of String(text)) {
+    const isSpace = /\s/.test(ch);
+    const isThai = THAI_CHAR_RE.test(ch);
+    if (curThai === null) { curThai = isThai; cur = ch; continue; }
+    if (isSpace || isThai === curThai) { cur += ch; }
+    else { runs.push({ text: cur, thai: curThai }); cur = ch; curThai = isThai; }
+  }
+  if (cur) runs.push({ text: cur, thai: curThai });
+  return runs;
+}
+/* Draws text that may mix Thai and Latin/digits by rendering each script
+   run in its own font, positioned end-to-end — jsPDF can only set one
+   font per text() call, so a single mixed string has to be drawn in
+   pieces. Supports left/right/center alignment like doc.text() would. */
+function drawMixedText(doc, text, x, y, opts) {
+  opts = opts || {};
+  const size = opts.size || 10;
+  const bold = !!opts.bold;
+  const align = opts.align || 'left';
+  doc.setFontSize(size);
+  const runs = splitMixedRuns(text);
+  const widths = runs.map(r => {
+    doc.setFont(r.thai ? 'SarabunThai' : 'helvetica', bold ? 'bold' : 'normal');
+    return doc.getTextWidth(r.text);
+  });
+  const total = widths.reduce((a, b) => a + b, 0);
+  let cx = x;
+  if (align === 'right') cx = x - total;
+  else if (align === 'center') cx = x - total / 2;
+  runs.forEach((r, i) => {
+    doc.setFont(r.thai ? 'SarabunThai' : 'helvetica', bold ? 'bold' : 'normal');
+    doc.text(r.text, cx, y);
+    cx += widths[i];
+  });
+  return total;
+}
+
+async function buildFormalRangeReportPdf(doc) {
+  const { fromStr, toStr, summary } = lastRangeReport;
+  await loadSarabunFontData();
+  registerSarabunFont(doc);
+
+  const pageW = doc.internal.pageSize.getWidth();
+  const pageH = doc.internal.pageSize.getHeight();
+  const margin = 42;
+  const teal = [31, 74, 56];
+  const textDim = [92, 87, 76];
+  const lineColor = [222, 218, 209];
+  const rowAlt = [245, 244, 240];
+
+  const fmtDate = (isoDateStr) => {
+    const d = new Date(isoDateStr + 'T00:00:00');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    return `${dd}/${mm}/${d.getFullYear()}`;
+  };
+  const now = new Date();
+  const genStamp = `${fmtDate(now.toISOString().slice(0, 10))} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const docNo = `MP-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+  const names = Object.keys(summary).sort();
+
+  function drawHeader() {
+    let y = margin;
+    try {
+      const logoSrc = document.getElementById('homeLogoImg').src;
+      doc.addImage(logoSrc, 'PNG', margin, y - 6, 34, 34);
+    } catch (e) { /* logo is optional decoration */ }
+    doc.setTextColor(...teal);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text('Matcha People', margin + 44, y + 14);
+    doc.setTextColor(...textDim);
+    drawMixedText(doc, 'รายงานสรุปการเคลื่อนไหวสต็อก', margin + 44, y + 30, { size: 10.5 });
+    doc.setTextColor(0, 0, 0);
+    y += 50;
+
+    const boxY = y, boxH = 54;
+    doc.setDrawColor(...lineColor);
+    doc.setLineWidth(0.75);
+    doc.rect(margin, boxY, pageW - margin * 2, boxH);
+    const colW = (pageW - margin * 2) / 2;
+    const metaRows = [
+      ['เลขที่เอกสาร', docNo],
+      ['ช่วงวันที่', `${fmtDate(fromStr)} - ${fmtDate(toStr)}`],
+      ['วันที่ออกรายงาน', genStamp],
+      ['จำนวนรายการ', `${names.length} รายการ`],
+    ];
+    let my = boxY + 17;
+    metaRows.forEach((row, i) => {
+      const cx = margin + 14 + (i % 2) * colW;
+      doc.setTextColor(...textDim);
+      drawMixedText(doc, row[0] + ':', cx, my, { size: 9 });
+      doc.setTextColor(20, 20, 20);
+      drawMixedText(doc, row[1], cx + 82, my, { size: 9, bold: true });
+      if (i % 2 === 1) my += 20;
+    });
+    doc.setTextColor(0, 0, 0);
+    return boxY + boxH + 22;
+  }
+
+  function drawTableHeader(y) {
+    const cols = [
+      { label: '#', x: margin, w: 22, align: 'left' },
+      { label: 'รายการ', x: margin + 26, w: 226, align: 'left' },
+      { label: 'รับเข้า', x: margin + 258, w: 62, align: 'right' },
+      { label: 'จ่ายออก', x: margin + 328, w: 62, align: 'right' },
+      { label: 'สุทธิ', x: margin + 398, w: 52, align: 'right' },
+      { label: 'คงเหลือล่าสุด', x: margin + 458, w: (pageW - margin) - (margin + 458), align: 'right' },
+    ];
+    doc.setFillColor(...teal);
+    doc.rect(margin, y, pageW - margin * 2, 22, 'F');
+    doc.setTextColor(255, 255, 255);
+    cols.forEach(c => {
+      const tx = c.align === 'right' ? c.x + c.w - 4 : c.x + 4;
+      drawMixedText(doc, c.label, tx, y + 15, { size: 9.5, bold: true, align: c.align });
+    });
+    doc.setTextColor(0, 0, 0);
+    return { y: y + 22, cols };
+  }
+
+  function drawFooter(pageNumber) {
+    doc.setDrawColor(...lineColor);
+    doc.setLineWidth(0.5);
+    doc.line(margin, pageH - 34, pageW - margin, pageH - 34);
+    doc.setTextColor(...textDim);
+    drawMixedText(doc, `สร้างโดยระบบจัดการสต็อก Matcha People - ${genStamp}`, margin, pageH - 20, { size: 8 });
+    drawMixedText(doc, `หน้า ${pageNumber}`, pageW - margin, pageH - 20, { size: 8, align: 'right' });
+    doc.setTextColor(0, 0, 0);
+  }
+
+  let pageNum = 1;
+  let y = drawHeader();
+  let tbl = drawTableHeader(y);
+  y = tbl.y;
+  let cols = tbl.cols;
+  const rowH = 20;
+
+  names.forEach((name, idx) => {
+    if (y + rowH > pageH - 60) {
+      drawFooter(pageNum);
+      doc.addPage();
+      pageNum++;
+      y = drawHeader();
+      tbl = drawTableHeader(y);
+      y = tbl.y; cols = tbl.cols;
+    }
+    if (idx % 2 === 1) {
+      doc.setFillColor(...rowAlt);
+      doc.rect(margin, y, pageW - margin * 2, rowH, 'F');
+    }
+    const s = summary[name];
+    const net = s.in - s.out;
+    doc.setTextColor(20, 20, 20);
+    drawMixedText(doc, String(idx + 1), cols[0].x + 4, y + 14, { size: 9.5 });
+    drawMixedText(doc, name, cols[1].x + 4, y + 14, { size: 9.5 });
+    drawMixedText(doc, `+${s.in}`, cols[2].x + cols[2].w - 4, y + 14, { size: 9.5, align: 'right' });
+    drawMixedText(doc, `-${s.out}`, cols[3].x + cols[3].w - 4, y + 14, { size: 9.5, align: 'right' });
+    doc.setTextColor(...(net > 0 ? teal : net < 0 ? [168, 54, 43] : [20, 20, 20]));
+    drawMixedText(doc, `${net > 0 ? '+' : ''}${net}`, cols[4].x + cols[4].w - 4, y + 14, { size: 9.5, bold: true, align: 'right' });
+    doc.setTextColor(20, 20, 20);
+    drawMixedText(doc, `${s.lastQty} ${s.unit || ''}`, cols[5].x + cols[5].w - 4, y + 14, { size: 9.5, align: 'right' });
+    doc.setDrawColor(...lineColor);
+    doc.setLineWidth(0.4);
+    doc.line(margin, y + rowH, pageW - margin, y + rowH);
+    y += rowH;
+  });
+
+  if (y + 90 > pageH - 60) {
+    drawFooter(pageNum);
+    doc.addPage();
+    pageNum++;
+    y = drawHeader();
+  } else {
+    y += 30;
+  }
+  const sigW = (pageW - margin * 2 - 40) / 2;
+  doc.setDrawColor(...textDim);
+  doc.setLineWidth(0.5);
+  doc.line(margin, y + 40, margin + sigW, y + 40);
+  doc.line(margin + sigW + 40, y + 40, margin + sigW * 2 + 40, y + 40);
+  doc.setTextColor(...textDim);
+  drawMixedText(doc, 'ผู้จัดทำรายงาน', margin, y + 54, { size: 9 });
+  drawMixedText(doc, 'ผู้ตรวจสอบ', margin + sigW + 40, y + 54, { size: 9 });
+  doc.setTextColor(0, 0, 0);
+
+  drawFooter(pageNum);
+}
+
+/* Fallback only: used if the Thai font couldn't be fetched (e.g. no
+   internet at export time). Renders the on-screen report to an image so
+   the export still succeeds, just without native selectable text. */
+async function buildScreenshotRangeReportPdf(doc) {
+  const { fromStr, toStr } = lastRangeReport;
+  const sheet = document.createElement('div');
+  sheet.style.cssText = 'position:fixed; left:-9999px; top:0; width:760px; background:#fff; padding:36px; font-family:"Public Sans",sans-serif; color:#181511;';
+  sheet.innerHTML = `
+    <div style="font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:20px; margin-bottom:4px;">Matcha People — รายงานสต็อก</div>
+    <div style="font-size:12px; color:#5C574C; margin-bottom:18px;">
+      ช่วงวันที่ ${esc(new Date(fromStr).toLocaleDateString('th-TH'))} – ${esc(new Date(toStr).toLocaleDateString('th-TH'))}
+      · พิมพ์เมื่อ ${esc(new Date().toLocaleString('th-TH'))}
+    </div>
+    ${document.getElementById('rrContent').innerHTML}
+  `;
+  document.body.appendChild(sheet);
+  const canvas = await html2canvas(sheet, { scale: 2, backgroundColor: '#ffffff' });
+  document.body.removeChild(sheet);
+
+  const pageW = doc.internal.pageSize.getWidth();
+  const pageH = doc.internal.pageSize.getHeight();
+  const margin = 24;
+  const usableW = pageW - margin * 2;
+  const imgH = (canvas.height * usableW) / canvas.width;
+  let renderedH = 0, first = true;
+  while (renderedH < imgH) {
+    if (!first) doc.addPage();
+    first = false;
+    doc.addImage(canvas, 'PNG', margin, margin - renderedH, usableW, imgH, undefined, 'FAST');
+    renderedH += pageH - margin * 2;
+  }
+}
+
+async function exportRangeReportPdf() {
+  if (!lastRangeReport || !document.getElementById('rrContent').querySelector('.rr-summary-row, .rr-detail-row')) {
     showToast('โหลดรายงานก่อน แล้วค่อย Export PDF');
     return;
   }
-  window.print();
-});
+  if (!window.jspdf || !window.jspdf.jsPDF) {
+    showToast('โหลดตัวสร้าง PDF ไม่สำเร็จ ลองใหม่ (ต้องต่ออินเทอร์เน็ต)');
+    return;
+  }
+  const btn = document.getElementById('rrExportBtn');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'กำลังสร้าง PDF...';
+  try {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+    try {
+      await buildFormalRangeReportPdf(doc);
+    } catch (fontErr) {
+      console.warn('formal PDF build failed, falling back to image export', fontErr);
+      if (!window.html2canvas) throw fontErr;
+      // start over on a clean document in case the failed attempt left partial content
+      const doc2 = new jsPDF({ unit: 'pt', format: 'a4' });
+      await buildScreenshotRangeReportPdf(doc2);
+      doc2.save(`matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.pdf`);
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+      return;
+    }
+    doc.save(`matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.pdf`);
+  } catch (e) {
+    console.warn('pdf export failed', e);
+    showToast('สร้าง PDF ไม่สำเร็จ ลองใหม่อีกครั้ง');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+document.getElementById('rrExportBtn').addEventListener('click', exportRangeReportPdf);
 
 /* ---------- Static icon slots ---------- */
 document.getElementById('searchIcon').innerHTML = ICONS.search();
@@ -1372,6 +1836,28 @@ function esc(s){
   const d = document.createElement('div');
   d.textContent = s ?? '';
   return d.innerHTML;
+}
+/* Copy-to-clipboard that also works in contexts where the async Clipboard
+   API is blocked or missing (some in-app / Add-to-Home-Screen webviews) by
+   falling back to the older execCommand('copy') technique. */
+function copyToClipboard(text, successMsg) {
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed; left:-9999px; top:0; opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    showToast(ok ? successMsg : 'คัดลอกไม่สำเร็จ (เบราว์เซอร์ไม่รองรับ)');
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => showToast(successMsg)).catch(fallback);
+  } else {
+    fallback();
+  }
 }
 let toastTimer = null;
 function showToast(msg) {
@@ -1573,6 +2059,7 @@ function adjustStock(id, loc, delta, staffName) {
   it[key] = Math.max(0, (it[key] || 0) + delta);
   const newTotal = totalQty(it);
   const nowLow = newTotal <= it.minQty;
+  touch(it);
   saveItems(items);
   const nameLabel = staffName ? ` · โดย ${staffName}` : '';
   const entry = { id: uid(), itemId: id, name: `${it.name} (${locLabel})${nameLabel}`, delta, qtyAfter: it[key], time: new Date().toISOString(), staffName: staffName || null };
@@ -1720,6 +2207,7 @@ function contactSupplier(id) {
 function deleteItem(id) {
   const it = items.find(x => x.id === id);
   items = items.filter(x => x.id !== id);
+  recordTombstone(DELETED_ITEM_IDS_KEY, id);
   saveItems(items);
   showToast(it ? `ลบ "${it.name}" แล้ว` : 'ลบแล้ว');
   render();
@@ -1822,11 +2310,7 @@ document.getElementById('qrBtn').addEventListener('click', () => { if (editingId
 document.getElementById('closeQrModal').addEventListener('click', closeQRModal);
 document.getElementById('qrCopyBtn').addEventListener('click', () => {
   const link = document.getElementById('qrLinkText').textContent;
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(link).then(() => showToast('คัดลอกลิงก์แล้ว')).catch(() => showToast('คัดลอกไม่สำเร็จ'));
-  } else {
-    showToast('คัดลอกไม่สำเร็จ (เบราว์เซอร์ไม่รองรับ)');
-  }
+  copyToClipboard(link, 'คัดลอกลิงก์แล้ว');
 });
 
 /* ---------- QR by category (e.g. Ingredients / Packing shelf signs) ---------- */
@@ -1945,9 +2429,9 @@ document.getElementById('groupSaveBtn').addEventListener('click', () => {
   const itemIds = Array.from(document.querySelectorAll('[data-group-item-check]:checked')).map(el => el.getAttribute('data-group-item-check'));
   if (groupEditingId) {
     const g = customGroups.find(x => x.id === groupEditingId);
-    if (g) { g.name = name; g.itemIds = itemIds; }
+    if (g) { g.name = name; g.itemIds = itemIds; touch(g); }
   } else {
-    customGroups.push({ id: uid(), name, itemIds });
+    customGroups.push(touch({ id: uid(), name, itemIds }));
   }
   saveCustomGroups(customGroups);
   closeGroupEditModal();
@@ -1958,6 +2442,7 @@ document.getElementById('groupDeleteBtn').addEventListener('click', () => {
   if (!groupEditingId) return;
   if (!confirm('ลบกลุ่มนี้? (ไม่กระทบสินค้าจริงในสต็อก)')) return;
   customGroups = customGroups.filter(x => x.id !== groupEditingId);
+  recordTombstone(DELETED_GROUP_IDS_KEY, groupEditingId);
   saveCustomGroups(customGroups);
   closeGroupEditModal();
   renderCustomGroupList();
@@ -2065,8 +2550,9 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   if (editingId) {
     const it = items.find(x => x.id === editingId);
     Object.assign(it, { name, category: itemEditCat, qtyFront, qtyBack, minQty, frontTarget, unit, supplierName, supplierPhone, supplierLine, supplierLink });
+    touch(it);
   } else {
-    items.push({ id: uid(), name, category: itemEditCat, qtyFront, qtyBack, minQty, frontTarget, unit, supplierName, supplierPhone, supplierLine, supplierLink });
+    items.push(touch({ id: uid(), name, category: itemEditCat, qtyFront, qtyBack, minQty, frontTarget, unit, supplierName, supplierPhone, supplierLine, supplierLink }));
     showToast(`เพิ่ม "${name}" แล้ว`);
   }
   saveItems(items);
@@ -2100,6 +2586,7 @@ document.getElementById('staffDeleteBtn').addEventListener('click', () => {
   if (editingStaffId) {
     const s = staffList.find(x => x.id === editingStaffId);
     staffList = staffList.filter(x => x.id !== editingStaffId);
+    recordTombstone(DELETED_STAFF_IDS_KEY, editingStaffId);
     saveStaff(staffList);
     showToast(s ? `ลบ "${s.name}" แล้ว` : 'ลบแล้ว');
   }
@@ -2116,8 +2603,9 @@ document.getElementById('staffSaveBtn').addEventListener('click', () => {
   if (editingStaffId) {
     const s = staffList.find(x => x.id === editingStaffId);
     Object.assign(s, { name, position, store });
+    touch(s);
   } else {
-    staffList.push({ id: uid(), name, position, store, days: emptyDays() });
+    staffList.push(touch({ id: uid(), name, position, store, days: emptyDays() }));
     showToast(`เพิ่ม "${name}" แล้ว`);
   }
   saveStaff(staffList);
@@ -2162,6 +2650,7 @@ document.getElementById('daySaveBtn').addEventListener('click', () => {
   if (!s) return;
   const text = document.getElementById('dfText').value.trim();
   s.days[dayEditing.dayKey] = { text: dayEditCat === 'off' ? '' : text, cat: dayEditCat };
+  touch(s);
   saveStaff(staffList);
   closeDayModal();
   render();
@@ -2238,6 +2727,7 @@ document.getElementById('transferSaveBtn').addEventListener('click', () => {
   it[fromKey] = Math.max(0, available - qty);
   it[toKey] = (it[toKey] || 0) + qty;
   const nowLow = totalQty(it) <= it.minQty;
+  touch(it);
   saveItems(items);
 
   const entry = { id: uid(), itemId: it.id, name: `${it.name} (ย้าย ${fromLabel}→${toLabel})`, delta: qty, qtyAfter: it[toKey], time: new Date().toISOString() };
@@ -2274,11 +2764,7 @@ document.getElementById('closeReportModal').addEventListener('click', closeRepor
 document.getElementById('reportCopyBtn').addEventListener('click', () => {
   const text = `Matcha report (${new Date().toLocaleDateString('en-US', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })})\n` +
     teaPowderItems().map(it => `${it.name}: ${totalQty(it)}`).join('\n');
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => showToast('คัดลอกรายงานแล้ว')).catch(() => showToast('คัดลอกไม่สำเร็จ'));
-  } else {
-    showToast('คัดลอกไม่สำเร็จ (เบราว์เซอร์ไม่รองรับ)');
-  }
+  copyToClipboard(text, 'คัดลอกรายงานแล้ว');
 });
 
 /* ---------- Monday reminder banner: nudge to do the weekly matcha powder report ---------- */
@@ -2302,6 +2788,7 @@ const rosterFieldMap = { rStoreLabel:'storeLabel', rDateRange:'dateRange', rShif
 Object.keys(rosterFieldMap).forEach(id => {
   document.getElementById(id).addEventListener('input', (e) => {
     rosterMeta[rosterFieldMap[id]] = e.target.value;
+    touch(rosterMeta);
     saveRosterMeta(rosterMeta);
     if (id === 'rDateRange') {
       document.getElementById('subtitle').textContent = `STAFF ROSTER · ${rosterMeta.dateRange || 'สัปดาห์นี้'}`;
@@ -2311,7 +2798,7 @@ Object.keys(rosterFieldMap).forEach(id => {
 
 document.getElementById('resetWeekBtn').addEventListener('click', () => {
   if (!confirm('ล้างตารางกะทั้งหมดของสัปดาห์นี้? (ชื่อพนักงาน/ตำแหน่งจะไม่หาย)')) return;
-  staffList.forEach(s => { s.days = emptyDays(); });
+  staffList.forEach(s => { s.days = emptyDays(); touch(s); });
   saveStaff(staffList);
   showToast('เริ่มสัปดาห์ใหม่แล้ว');
   render();
