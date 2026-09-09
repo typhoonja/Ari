@@ -169,6 +169,14 @@
   .icon-btn:disabled{opacity:.3;}
   .qty-display{font-family:'IBM Plex Mono',monospace; font-size:19px; font-weight:700; width:48px; text-align:center;}
   .qty-display.low{color:var(--red);}
+  .qty-adjust-btn{
+    font-family:'IBM Plex Mono',monospace; font-size:17px; font-weight:700; text-align:center;
+    min-width:56px; height:42px; padding:0 12px; border-radius:8px; border:none; cursor:pointer;
+    background:var(--teal-bg); color:var(--teal); flex-shrink:0;
+  }
+  .qty-adjust-btn:active{transform:scale(0.95);}
+  .qty-adjust-btn.low{background:var(--coral-bg); color:var(--coral);}
+  .qty-adjust-btn.warn{background:var(--amber-bg); color:var(--amber);}
 
   /* Activity */
   #activity{padding:32px 20px 0;}
@@ -597,6 +605,23 @@
 <button id="fab" aria-label="เพิ่ม"></button>
 <div id="toast"></div>
 
+<!-- qrFocusOverlay is placed first among the overlays so every other popup
+     (edit item, transfer, adjust quantity) reliably paints — and is
+     clickable — on top of it when opened from within a QR-scan popup that's
+     still open underneath. Overlays later in the DOM stack visually above
+     earlier ones at the same z-index; without this ordering, taps meant for
+     a popup opened from inside the QR view landed on the QR view's own
+     content instead. -->
+<div class="overlay" id="qrFocusOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 class="font-display" id="qrFocusTitle">รายการ</h2>
+      <button class="close-btn" id="closeQrFocusModal"></button>
+    </div>
+    <div id="qrFocusList"></div>
+  </div>
+</div>
+
 <div class="overlay" id="overlay">
   <div class="modal">
     <div class="modal-head">
@@ -808,6 +833,31 @@
   </div>
 </div>
 
+<div class="overlay" id="adjustQtyOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 class="font-display" id="adjustQtyModalTitle">ปรับจำนวน</h2>
+      <button class="close-btn" id="closeAdjustQtyModal"></button>
+    </div>
+
+    <p class="item-min font-mono" id="adjustQtyCurrentQty" style="margin:-12px 0 20px;"></p>
+
+    <div class="field" style="margin-bottom:16px;">
+      <label>รายการ</label>
+      <div class="cat-picker" id="adjustQtyDirPicker"></div>
+    </div>
+
+    <div class="field mono">
+      <label class="amber"></label>
+      <input id="aqQty" class="amber-border" inputmode="numeric" pattern="[0-9]*" placeholder="0" />
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn-save" id="adjustQtySaveBtn">บันทึก</button>
+    </div>
+  </div>
+</div>
+
 <div class="overlay" id="reportOverlay">
   <div class="modal">
     <div class="modal-head">
@@ -847,16 +897,6 @@
     <div class="modal-actions">
       <button class="btn-save" id="rrExportBtn">Export PDF</button>
     </div>
-  </div>
-</div>
-
-<div class="overlay" id="qrFocusOverlay">
-  <div class="modal">
-    <div class="modal-head">
-      <h2 class="font-display" id="qrFocusTitle">รายการ</h2>
-      <button class="close-btn" id="closeQrFocusModal"></button>
-    </div>
-    <div id="qrFocusList"></div>
   </div>
 </div>
 
@@ -1887,6 +1927,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 function render() {
   if (activeTab === 'staff') renderStaffView();
   else renderStock();
+  renderQrFocusList();
 }
 
 /* ---------- Render: Store / Stock ---------- */
@@ -1927,9 +1968,7 @@ function itemCardHtml(it, locKey, locCode) {
             ${it.supplierLine ? `<a class="icon-btn line" href="${esc(buildLineHref(it.supplierLine))}" target="_blank" rel="noopener noreferrer" aria-label="เปิด LINE">${ICONS.chat()}</a>` : ''}
             ${it.supplierLink ? `<a class="icon-btn link" href="${esc(it.supplierLink)}" target="_blank" rel="noopener noreferrer" aria-label="เปิดลิงก์สั่งของ">${ICONS.link()}</a>` : ''}
             <button class="icon-btn transfer" data-transfer="${it.id}" aria-label="ย้ายสินค้า">${ICONS.swap()}</button>
-            <button class="icon-btn minus" data-adjust="${it.id}" data-loc="${locCode}" data-delta="-1" ${locQty<=0?'disabled':''}>${ICONS.minus()}</button>
-            <div class="qty-display ${stateClass}">${locQty}</div>
-            <button class="icon-btn plus" data-adjust="${it.id}" data-loc="${locCode}" data-delta="1">${ICONS.plus()}</button>
+            <button type="button" class="qty-adjust-btn ${stateClass}" data-adjust-open="${it.id}" data-loc="${locCode}" aria-label="ปรับจำนวน ${esc(it.name)}">${locQty}</button>
           </div>
         </div>
       </div>`;
@@ -1946,7 +1985,14 @@ function renderStock() {
         return (it.qtyFront || 0) < target && (it.qtyBack || 0) > 0;
       })
     : [];
-  document.getElementById('subtitle').textContent = `${items.length} รายการ`;
+  const filtered = items
+    .filter(it => it.name.toLowerCase().includes(query.trim().toLowerCase()))
+    .filter(it => !categoryFilter || (it.category || 'other') === categoryFilter)
+    .filter(it => !groupFilter || (customGroups.find(g => g.id === groupFilter)?.itemIds || []).includes(it.id));
+  const isFiltering = query.trim() !== '' || !!categoryFilter || !!groupFilter;
+  document.getElementById('subtitle').textContent = isFiltering
+    ? `${filtered.length} จาก ${items.length} รายการ`
+    : `${items.length} รายการ`;
 
   const filterBadge = document.getElementById('catFilterBadge');
   if (categoryFilter || groupFilter) {
@@ -2003,10 +2049,6 @@ function renderStock() {
   }
   stripEl.innerHTML = stripHtml;
 
-  const filtered = items
-    .filter(it => it.name.toLowerCase().includes(query.trim().toLowerCase()))
-    .filter(it => !categoryFilter || (it.category || 'other') === categoryFilter)
-    .filter(it => !groupFilter || (customGroups.find(g => g.id === groupFilter)?.itemIds || []).includes(it.id));
   const listEl = document.getElementById('list');
   if (filtered.length === 0) {
     listEl.innerHTML = `<div class="empty">
@@ -2266,8 +2308,8 @@ function renderItemCatPicker() {
   `).join('');
 }
 function openModal(id) {
-  editingId = id || null;
   const it = id ? items.find(x => x.id === id) : null;
+  editingId = it ? id : null; // an id that doesn't match any item (e.g. a stale/deleted item's QR code) falls back to "add new" in both the UI and internal state, instead of leaving them out of sync
   document.getElementById('modalTitle').textContent = it ? 'แก้ไขสินค้า' : 'เพิ่มสินค้าใหม่';
   document.getElementById('fName').value = it?.name || '';
   itemEditCat = it?.category || 'other';
@@ -2403,8 +2445,8 @@ function renderGroupItemChecklist(filterText, selectedIds) {
   `).join('');
 }
 function openGroupEditModal(groupId) {
-  groupEditingId = groupId;
   const g = groupId ? customGroups.find(x => x.id === groupId) : null;
+  groupEditingId = g ? groupId : null; // keep in sync with whether the group actually exists
   document.getElementById('groupEditTitle').textContent = g ? 'แก้ไขกลุ่ม' : 'สร้างกลุ่มใหม่';
   document.getElementById('groupNameInput').value = g ? g.name : '';
   document.getElementById('groupItemSearch').value = '';
@@ -2474,7 +2516,7 @@ function applyDeepLinkFromURL(retry) {
     const it = items.find(x => x.id === itemId);
     if (it) {
       if (openWhat === 'transfer') openTransferModal(itemId);
-      else openModal(itemId);
+      else openQrFocusView('item', itemId, tab); // quick +/- adjust, not the full edit form — scanning an item's QR should let you tap-adjust it immediately
     } else if (!retry) {
       // items may still be loading from cloud sync — try again shortly
       setTimeout(() => applyDeepLinkFromURL(true), 1200);
@@ -2484,18 +2526,49 @@ function applyDeepLinkFromURL(retry) {
   }
 }
 
-/* Focused pop-up for QR codes: scanning a category/group QR shows just that
-   list on its own, instead of filtering inside the full Store/Stock page. */
-function openQrFocusView(kind, value, tab) {
+/* Focused pop-up for QR codes: scanning a category/group/item QR shows just
+   that list on its own, instead of filtering inside the full Store/Stock page.
+   qrFocusState remembers what's currently shown so renderQrFocusList() (called
+   from render(), below) can refresh the popup's own list after every tap —
+   without this, the popup's displayed quantity and button disabled-state go
+   stale after the very first +/- tap, since it isn't part of the normal
+   render() cycle otherwise: the underlying data updates correctly, but a
+   button that *looked* enabled at open-time can end up frozen mid-interaction. */
+let qrFocusState = null;
+function renderQrFocusList() {
+  if (!qrFocusState) return;
+  const { kind, value, tab } = qrFocusState;
   const locCode = tab === 'stock' ? 'Back' : 'Front';
   const locKey = locCode === 'Back' ? 'qtyBack' : 'qtyFront';
-
-  let title = 'รายการ';
   let list = [];
-  if (kind === 'cat') {
+  if (kind === 'item') {
+    const it = items.find(x => x.id === value);
+    list = it ? [it] : [];
+  } else if (kind === 'cat') {
+    list = items.filter(it => (it.category || 'other') === value);
+  } else if (kind === 'group') {
+    const g = customGroups.find(x => x.id === value);
+    const ids = new Set(g ? (g.itemIds || []) : []);
+    list = items.filter(it => ids.has(it.id));
+  }
+  const listEl = document.getElementById('qrFocusList');
+  listEl.innerHTML = list.length
+    ? list.map(it => itemCardHtml(it, locKey, locCode)).join('')
+    : '<div class="empty">ไม่พบสินค้าในรายการนี้</div>';
+}
+function openQrFocusView(kind, value, tab) {
+  let title = 'รายการ';
+  if (kind === 'item') {
+    const it = items.find(x => x.id === value);
+    if (!it) {
+      // item may still be loading from cloud sync — try again shortly
+      setTimeout(() => openQrFocusView(kind, value, tab), 1200);
+      return;
+    }
+    title = it.name;
+  } else if (kind === 'cat') {
     const c = ITEM_CATEGORIES.find(x => x.key === value);
     title = c ? c.label : value;
-    list = items.filter(it => (it.category || 'other') === value);
   } else if (kind === 'group') {
     const g = customGroups.find(x => x.id === value);
     if (!g) {
@@ -2504,18 +2577,15 @@ function openQrFocusView(kind, value, tab) {
       return;
     }
     title = g.name;
-    const ids = new Set(g.itemIds || []);
-    list = items.filter(it => ids.has(it.id));
   }
 
+  qrFocusState = { kind, value, tab };
   document.getElementById('qrFocusTitle').textContent = title;
-  const listEl = document.getElementById('qrFocusList');
-  listEl.innerHTML = list.length
-    ? list.map(it => itemCardHtml(it, locKey, locCode)).join('')
-    : '<div class="empty">ไม่พบสินค้าในรายการนี้</div>';
+  renderQrFocusList();
   document.getElementById('qrFocusOverlay').classList.add('open');
 }
 document.getElementById('closeQrFocusModal').addEventListener('click', () => {
+  qrFocusState = null;
   document.getElementById('qrFocusOverlay').classList.remove('open');
 });
 
@@ -2569,8 +2639,8 @@ document.getElementById('saveBtn').addEventListener('click', () => {
 /* ---------- Staff modal ---------- */
 const staffOverlay = document.getElementById('staffOverlay');
 function openStaffModal(id) {
-  editingStaffId = id || null;
   const s = id ? staffList.find(x => x.id === id) : null;
+  editingStaffId = s ? id : null; // keep in sync with whether the staff record actually exists
   document.getElementById('staffModalTitle').textContent = s ? 'แก้ไขพนักงาน' : 'เพิ่มพนักงาน';
   document.getElementById('sfName').value = s?.name || '';
   document.getElementById('sfPosition').value = s?.position || 'Staff';
@@ -2741,6 +2811,70 @@ document.getElementById('transferSaveBtn').addEventListener('click', () => {
   render();
 });
 
+/* ---------- Adjust quantity (typed amount received/used, instead of tapping +/- one at a time) ---------- */
+let adjustQtyItemId = null;
+let adjustQtyLoc = null; // 'Front' or 'Back' — which location's stock this adjusts
+let adjustQtyDirection = 'in'; // 'in' = received (add), 'out' = used/sold (subtract)
+const ADJUST_QTY_DIRS = [
+  { key: 'in', label: 'รับเข้า (+)' },
+  { key: 'out', label: 'ใช้ไป / จ่ายออก (-)' },
+];
+function renderAdjustQtyDirPicker() {
+  const picker = document.getElementById('adjustQtyDirPicker');
+  picker.innerHTML = ADJUST_QTY_DIRS.map(d => `
+    <button type="button" class="cat-pill cat-none ${adjustQtyDirection === d.key ? 'selected' : ''}" data-aqdir="${d.key}">${d.label}</button>
+  `).join('');
+}
+function updateAdjustQtyCurrentQty() {
+  const it = items.find(x => x.id === adjustQtyItemId);
+  if (!it) return;
+  const label = adjustQtyLoc === 'Front' ? 'หน้าร้าน' : 'คลัง';
+  const qty = adjustQtyLoc === 'Front' ? (it.qtyFront || 0) : (it.qtyBack || 0);
+  document.getElementById('adjustQtyCurrentQty').textContent = `ตอนนี้ · ${label} ${qty} ${it.unit}`;
+}
+function openAdjustQtyModal(id, loc) {
+  const it = items.find(x => x.id === id);
+  if (!it) return;
+  adjustQtyItemId = id;
+  adjustQtyLoc = loc;
+  adjustQtyDirection = 'in';
+  document.getElementById('adjustQtyModalTitle').textContent = `ปรับจำนวน · ${it.name}`;
+  document.getElementById('aqQty').value = '';
+  updateAdjustQtyCurrentQty();
+  renderAdjustQtyDirPicker();
+  document.getElementById('adjustQtyOverlay').classList.add('open');
+  setTimeout(() => document.getElementById('aqQty').focus(), 50);
+}
+function closeAdjustQtyModal() {
+  document.getElementById('adjustQtyOverlay').classList.remove('open');
+  adjustQtyItemId = null;
+}
+document.getElementById('closeAdjustQtyModal').addEventListener('click', closeAdjustQtyModal);
+document.getElementById('adjustQtyDirPicker').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-aqdir]');
+  if (!btn) return;
+  adjustQtyDirection = btn.getAttribute('data-aqdir');
+  renderAdjustQtyDirPicker();
+});
+document.getElementById('aqQty').addEventListener('input', e => {
+  e.target.value = e.target.value.replace(/[^0-9]/g, '');
+});
+document.getElementById('adjustQtySaveBtn').addEventListener('click', () => {
+  if (!adjustQtyItemId) return;
+  const id = adjustQtyItemId;
+  const loc = adjustQtyLoc;
+  const qty = parseInt(document.getElementById('aqQty').value, 10) || 0;
+  if (qty <= 0) { showToast('พิมพ์จำนวนก่อนนะ'); return; }
+  const delta = adjustQtyDirection === 'in' ? qty : -qty;
+  closeAdjustQtyModal();
+  if (delta < 0 && needsStaffName(id)) {
+    if (checkedInStaffName) { adjustStock(id, loc, delta, checkedInStaffName); return; }
+    openStaffNameModal({ id, loc, delta });
+    return;
+  }
+  adjustStock(id, loc, delta);
+});
+
 /* ---------- Report: matcha powder stock ---------- */
 const reportOverlay = document.getElementById('reportOverlay');
 function teaPowderItems() {
@@ -2820,17 +2954,9 @@ document.body.addEventListener('click', (e) => {
   const editTarget = e.target.closest('[data-edit]');
   if (editTarget) { openModal(editTarget.getAttribute('data-edit')); return; }
 
-  const adjustTarget = e.target.closest('[data-adjust]');
-  if (adjustTarget) {
-    const id = adjustTarget.getAttribute('data-adjust');
-    const loc = adjustTarget.getAttribute('data-loc');
-    const delta = parseInt(adjustTarget.getAttribute('data-delta'), 10);
-    if (delta < 0 && needsStaffName(id)) {
-      if (checkedInStaffName) { adjustStock(id, loc, delta, checkedInStaffName); return; }
-      openStaffNameModal({ id, loc, delta });
-      return;
-    }
-    adjustStock(id, loc, delta);
+  const adjustOpenTarget = e.target.closest('[data-adjust-open]');
+  if (adjustOpenTarget) {
+    openAdjustQtyModal(adjustOpenTarget.getAttribute('data-adjust-open'), adjustOpenTarget.getAttribute('data-loc'));
     return;
   }
 
