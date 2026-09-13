@@ -1935,12 +1935,7 @@ async function exportRangeReportJpg() {
   try {
     const canvas = await renderReportSheetToCanvas();
     const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-    const a = document.createElement('a');
-    a.href = dataUrl;
-    a.download = `matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.jpg`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    showJpgPreview(dataUrl, `matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.jpg`);
   } catch (e) {
     console.warn('jpg export failed', e);
     showToast('สร้าง JPG ไม่สำเร็จ ลองใหม่อีกครั้ง');
@@ -1950,6 +1945,28 @@ async function exportRangeReportJpg() {
   }
 }
 document.getElementById('rrExportJpgBtn').addEventListener('click', exportRangeReportJpg);
+
+/* A real, on-screen <a download> that the user taps directly works far more
+   reliably across browsers (especially iOS Safari) than a hidden link
+   clicked programmatically after an await — by then it's no longer tied
+   to the original tap and mobile Safari silently drops it. Showing the
+   image also lets anyone save it the universal way: press and hold. */
+function showJpgPreview(dataUrl, filename) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed; inset:0; background:rgba(20,18,15,.9); z-index:9999; display:flex; flex-direction:column; align-items:center; overflow:auto; padding:24px 16px 40px;';
+  overlay.innerHTML = `
+    <div style="color:#fff; font-size:14px; margin-bottom:14px; text-align:center; max-width:480px; line-height:1.5;">
+      กดค้างที่รูปด้านล่างเพื่อบันทึกลงเครื่อง หรือแตะปุ่ม "ดาวน์โหลด"
+    </div>
+    <img src="${dataUrl}" style="max-width:100%; border-radius:8px; box-shadow:0 4px 24px rgba(0,0,0,.4); margin-bottom:18px;" />
+    <div style="display:flex; gap:10px;">
+      <a href="${dataUrl}" download="${filename}" style="background:#fff; color:#181511; padding:12px 22px; border-radius:8px; font-weight:600; text-decoration:none; font-size:14px;">ดาวน์โหลด</a>
+      <button id="jpgPreviewCloseBtn" style="background:transparent; color:#fff; border:1px solid #fff; padding:12px 22px; border-radius:8px; font-weight:600; font-size:14px;">ปิด</button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#jpgPreviewCloseBtn').addEventListener('click', () => overlay.remove());
+}
 
 /* ---------- Static icon slots ---------- */
 document.getElementById('searchIcon').innerHTML = ICONS.search();
