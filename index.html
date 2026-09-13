@@ -896,6 +896,7 @@
     <div id="rrContent"></div>
     <div class="modal-actions">
       <button class="btn-save" id="rrExportBtn">Export PDF</button>
+      <button class="btn-save" id="rrExportJpgBtn" style="background:var(--coral-bg); color:var(--coral);">Export JPG</button>
     </div>
   </div>
 </div>
@@ -1253,11 +1254,29 @@ function mergeLog(localArr, serverArr) {
 
 function applyCloudSnapshot(data) {
   applyingCloudSnapshot = true;
-  if (Array.isArray(data.items)) { items = data.items; localStorage.setItem(ITEMS_KEY, JSON.stringify(items)); }
-  if (Array.isArray(data.log)) { log = data.log; localStorage.setItem(LOG_KEY, JSON.stringify(log)); }
-  if (Array.isArray(data.staffList)) { staffList = data.staffList; localStorage.setItem(STAFF_KEY, JSON.stringify(staffList)); }
-  if (data.rosterMeta) { rosterMeta = data.rosterMeta; localStorage.setItem(ROSTER_META_KEY, JSON.stringify(rosterMeta)); }
-  if (Array.isArray(data.customGroups)) { customGroups = data.customGroups; localStorage.setItem(CUSTOM_GROUPS_KEY, JSON.stringify(customGroups)); }
+  // Merge record-by-record (same rule as pushToCloud: newer updatedAt wins,
+  // tombstoned ids stay deleted) instead of blindly replacing the local
+  // arrays with whatever the server sends. A plain overwrite here was the
+  // cause of newly-added items vanishing: add an item, leave before the
+  // debounced push finishes (or before it reaches the server), and the very
+  // next snapshot — which still reflects the old server state — would wipe
+  // the new item back out of localStorage.
+  if (Array.isArray(data.items)) {
+    items = mergeCollection(items, data.items, loadTombstones(DELETED_ITEM_IDS_KEY));
+    localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
+  }
+  if (Array.isArray(data.log)) { log = mergeLog(log, data.log); localStorage.setItem(LOG_KEY, JSON.stringify(log)); }
+  if (Array.isArray(data.staffList)) {
+    staffList = mergeCollection(staffList, data.staffList, loadTombstones(DELETED_STAFF_IDS_KEY));
+    localStorage.setItem(STAFF_KEY, JSON.stringify(staffList));
+  }
+  if (data.rosterMeta && (data.rosterMeta.updatedAt || 0) > (rosterMeta.updatedAt || 0)) {
+    rosterMeta = data.rosterMeta; localStorage.setItem(ROSTER_META_KEY, JSON.stringify(rosterMeta));
+  }
+  if (Array.isArray(data.customGroups)) {
+    customGroups = mergeCollection(customGroups, data.customGroups, loadTombstones(DELETED_GROUP_IDS_KEY));
+    localStorage.setItem(CUSTOM_GROUPS_KEY, JSON.stringify(customGroups));
+  }
   applyingCloudSnapshot = false;
   render();
 }
@@ -1384,6 +1403,7 @@ function archiveActivity(entry, it) {
     qtyAfter: entry.qtyAfter,
     time: entry.time,
     staffName: entry.staffName || null,
+    kind: entry.kind || 'adjust',
     ts: new Date(entry.time).getTime()
   };
   activityColRef.doc(entry.id).set(record).catch(err => console.warn('archive activity failed', err));
@@ -1514,23 +1534,41 @@ async function loadRangeReport() {
     return;
   }
 
-  // Per-item summary: total in (+), total out (-), net, and most recent qty-after in range
+  // Per-item summary: ใช้ไป (out) and รับเข้า (in) only count real stock
+  // movement — a sale/use, or a restock from the supplier. A transfer
+  // between หน้าร้าน/คลัง just moves existing stock around and must not be
+  // counted here, since it doesn't change the total. Entries archived
+  // before the `kind` field existed are caught by the fallback check on
+  // `label`, which always contains "ย้าย" for transfers.
+  // staffNames collects who actually cut (used) the stock — staffName is
+  // only ever recorded on a decrease, never on a restock or a transfer.
   const summary = {};
   rows.forEach(r => {
+    const isTransfer = r.kind === 'transfer' || (!r.kind && typeof r.label === 'string' && r.label.includes('ย้าย'));
+    if (isTransfer) return;
     const key = r.itemName || r.label || 'ไม่ทราบชื่อ';
-    if (!summary[key]) summary[key] = { in: 0, out: 0, unit: r.unit || '', lastQty: r.qtyAfter, lastTs: r.ts };
-    if (r.delta > 0) summary[key].in += r.delta; else summary[key].out += Math.abs(r.delta);
-    if (r.ts > summary[key].lastTs) { summary[key].lastQty = r.qtyAfter; summary[key].lastTs = r.ts; }
+    if (!summary[key]) summary[key] = { in: 0, out: 0, unit: r.unit || '', itemId: r.itemId, staffNames: new Set() };
+    if (r.delta > 0) summary[key].in += r.delta;
+    else { summary[key].out += Math.abs(r.delta); if (r.staffName) summary[key].staffNames.add(r.staffName); }
   });
 
   const summaryHtml = Object.keys(summary).sort().map(name => {
     const s = summary[name];
-    const net = s.in - s.out;
+    const it = items.find(x => x.id === s.itemId) || items.find(x => x.name === name);
+    const front = it ? (it.qtyFront || 0) : '-';
+    const back = it ? (it.qtyBack || 0) : '-';
+    const staffLine = s.staffNames.size ? `<br>ตัดโดย ${esc([...s.staffNames].join(', '))}` : '';
     return `<div class="rr-summary-row">
       <span class="rr-summary-name">${esc(name)}</span>
-      <span class="rr-summary-nums">รับ +${s.in} / จ่าย -${s.out}<br>สุทธิ <b>${net>0?'+':''}${net}</b> · คงเหลือล่าสุด <b>${s.lastQty} ${esc(s.unit)}</b></span>
+      <span class="rr-summary-nums">ใช้ไป -${s.out} ${esc(s.unit)} · รับเข้า +${s.in} ${esc(s.unit)}<br>คงเหลือหน้าร้าน <b>${front} ${esc(s.unit)}</b> · คงเหลือในสต็อก <b>${back} ${esc(s.unit)}</b>${staffLine}</span>
     </div>`;
   }).join('');
+
+  if (Object.keys(summary).length === 0) {
+    contentEl.innerHTML = '<div class="rr-empty">ช่วงนี้มีแต่การย้ายสต็อกภายใน ไม่มีการใช้หรือรับของใหม่</div>';
+    lastRangeReport = { fromStr, toStr, summary };
+    return;
+  }
 
   contentEl.innerHTML = `
     <div class="rr-summary-title">สรุปตามสินค้า (${Object.keys(summary).length} รายการ)</div>
@@ -1621,6 +1659,21 @@ function drawMixedText(doc, text, x, y, opts) {
   });
   return total;
 }
+function measureMixedTextWidth(doc, text, size) {
+  doc.setFontSize(size);
+  return splitMixedRuns(text).reduce((sum, r) => {
+    doc.setFont(r.thai ? 'SarabunThai' : 'helvetica', 'normal');
+    return sum + doc.getTextWidth(r.text);
+  }, 0);
+}
+/* Truncates with an ellipsis so a long list (e.g. several different staff
+   names on one item) never runs past a column's right edge. */
+function fitMixedText(doc, text, maxWidth, size) {
+  if (measureMixedTextWidth(doc, text, size) <= maxWidth) return text;
+  let t = text;
+  while (t.length > 1 && measureMixedTextWidth(doc, t + '…', size) > maxWidth) t = t.slice(0, -1);
+  return t + '…';
+}
 
 async function buildFormalRangeReportPdf(doc) {
   const { fromStr, toStr, summary } = lastRangeReport;
@@ -1648,18 +1701,21 @@ async function buildFormalRangeReportPdf(doc) {
 
   function drawHeader() {
     let y = margin;
+    // The logo file is a wide wordmark (roughly 10:1), not a square icon —
+    // scale it by that real ratio instead of forcing it into a fixed
+    // square box, which was squashing it. It already reads "Matcha
+    // People", so it replaces the separate text label below.
+    const logoRatio = 1200 / 118;
+    const logoH = 30;
+    const logoW = logoH * logoRatio;
     try {
       const logoSrc = document.getElementById('homeLogoImg').src;
-      doc.addImage(logoSrc, 'PNG', margin, y - 6, 34, 34);
+      doc.addImage(logoSrc, 'PNG', margin, y - 4, logoW, logoH);
     } catch (e) { /* logo is optional decoration */ }
-    doc.setTextColor(...teal);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(16);
-    doc.text('Matcha People', margin + 44, y + 14);
     doc.setTextColor(...textDim);
-    drawMixedText(doc, 'รายงานสรุปการเคลื่อนไหวสต็อก', margin + 44, y + 30, { size: 10.5 });
+    drawMixedText(doc, 'รายงานสรุปการเคลื่อนไหวสต็อก', margin, y + logoH + 12, { size: 10.5 });
     doc.setTextColor(0, 0, 0);
-    y += 50;
+    y += logoH + 28;
 
     const boxY = y, boxH = 54;
     doc.setDrawColor(...lineColor);
@@ -1688,11 +1744,11 @@ async function buildFormalRangeReportPdf(doc) {
   function drawTableHeader(y) {
     const cols = [
       { label: '#', x: margin, w: 22, align: 'left' },
-      { label: 'รายการ', x: margin + 26, w: 226, align: 'left' },
-      { label: 'รับเข้า', x: margin + 258, w: 62, align: 'right' },
-      { label: 'จ่ายออก', x: margin + 328, w: 62, align: 'right' },
-      { label: 'สุทธิ', x: margin + 398, w: 52, align: 'right' },
-      { label: 'คงเหลือล่าสุด', x: margin + 458, w: (pageW - margin) - (margin + 458), align: 'right' },
+      { label: 'รายการ', x: margin + 26, w: 176, align: 'left' },
+      { label: 'ใช้ไป', x: margin + 208, w: 58, align: 'right' },
+      { label: 'รับเข้า', x: margin + 270, w: 58, align: 'right' },
+      { label: 'คงเหลือหน้าร้าน', x: margin + 332, w: 88, align: 'right' },
+      { label: 'คงเหลือในสต็อก', x: margin + 424, w: (pageW - margin) - (margin + 424), align: 'right' },
     ];
     doc.setFillColor(...teal);
     doc.rect(margin, y, pageW - margin * 2, 22, 'F');
@@ -1720,9 +1776,12 @@ async function buildFormalRangeReportPdf(doc) {
   let tbl = drawTableHeader(y);
   y = tbl.y;
   let cols = tbl.cols;
-  const rowH = 20;
+  const baseRowH = 20, staffLineH = 12;
 
   names.forEach((name, idx) => {
+    const s = summary[name];
+    const staffList = s.staffNames ? [...s.staffNames].join(', ') : '';
+    const rowH = staffList ? baseRowH + staffLineH : baseRowH;
     if (y + rowH > pageH - 60) {
       drawFooter(pageNum);
       doc.addPage();
@@ -1735,17 +1794,23 @@ async function buildFormalRangeReportPdf(doc) {
       doc.setFillColor(...rowAlt);
       doc.rect(margin, y, pageW - margin * 2, rowH, 'F');
     }
-    const s = summary[name];
-    const net = s.in - s.out;
+    const it = items.find(x => x.id === s.itemId) || items.find(x => x.name === name);
+    const front = it ? (it.qtyFront || 0) : '-';
+    const back = it ? (it.qtyBack || 0) : '-';
     doc.setTextColor(20, 20, 20);
     drawMixedText(doc, String(idx + 1), cols[0].x + 4, y + 14, { size: 9.5 });
     drawMixedText(doc, name, cols[1].x + 4, y + 14, { size: 9.5 });
-    drawMixedText(doc, `+${s.in}`, cols[2].x + cols[2].w - 4, y + 14, { size: 9.5, align: 'right' });
-    drawMixedText(doc, `-${s.out}`, cols[3].x + cols[3].w - 4, y + 14, { size: 9.5, align: 'right' });
-    doc.setTextColor(...(net > 0 ? teal : net < 0 ? [168, 54, 43] : [20, 20, 20]));
-    drawMixedText(doc, `${net > 0 ? '+' : ''}${net}`, cols[4].x + cols[4].w - 4, y + 14, { size: 9.5, bold: true, align: 'right' });
-    doc.setTextColor(20, 20, 20);
-    drawMixedText(doc, `${s.lastQty} ${s.unit || ''}`, cols[5].x + cols[5].w - 4, y + 14, { size: 9.5, align: 'right' });
+    drawMixedText(doc, `-${s.out}`, cols[2].x + cols[2].w - 4, y + 14, { size: 9.5, align: 'right' });
+    drawMixedText(doc, `+${s.in}`, cols[3].x + cols[3].w - 4, y + 14, { size: 9.5, align: 'right' });
+    drawMixedText(doc, `${front} ${s.unit || ''}`, cols[4].x + cols[4].w - 4, y + 14, { size: 9.5, align: 'right' });
+    drawMixedText(doc, `${back} ${s.unit || ''}`, cols[5].x + cols[5].w - 4, y + 14, { size: 9.5, align: 'right' });
+    if (staffList) {
+      const maxStaffLineW = (pageW - margin) - (cols[1].x + 4) - 4;
+      const staffLineText = fitMixedText(doc, `ตัดโดย ${staffList}`, maxStaffLineW, 8);
+      doc.setTextColor(...textDim);
+      drawMixedText(doc, staffLineText, cols[1].x + 4, y + 26, { size: 8 });
+      doc.setTextColor(20, 20, 20);
+    }
     doc.setDrawColor(...lineColor);
     doc.setLineWidth(0.4);
     doc.line(margin, y + rowH, pageW - margin, y + rowH);
@@ -1773,10 +1838,10 @@ async function buildFormalRangeReportPdf(doc) {
   drawFooter(pageNum);
 }
 
-/* Fallback only: used if the Thai font couldn't be fetched (e.g. no
-   internet at export time). Renders the on-screen report to an image so
-   the export still succeeds, just without native selectable text. */
-async function buildScreenshotRangeReportPdf(doc) {
+/* Renders the on-screen report (title + date range + rrContent) into an
+   off-screen sheet and rasterizes it to a canvas — shared by the PDF
+   fallback (screenshot mode) and the JPG export below. */
+async function renderReportSheetToCanvas() {
   const { fromStr, toStr } = lastRangeReport;
   const sheet = document.createElement('div');
   sheet.style.cssText = 'position:fixed; left:-9999px; top:0; width:760px; background:#fff; padding:36px; font-family:"Public Sans",sans-serif; color:#181511;';
@@ -1791,6 +1856,14 @@ async function buildScreenshotRangeReportPdf(doc) {
   document.body.appendChild(sheet);
   const canvas = await html2canvas(sheet, { scale: 2, backgroundColor: '#ffffff' });
   document.body.removeChild(sheet);
+  return canvas;
+}
+
+/* Fallback only: used if the Thai font couldn't be fetched (e.g. no
+   internet at export time). Renders the on-screen report to an image so
+   the export still succeeds, just without native selectable text. */
+async function buildScreenshotRangeReportPdf(doc) {
+  const canvas = await renderReportSheetToCanvas();
 
   const pageW = doc.internal.pageSize.getWidth();
   const pageH = doc.internal.pageSize.getHeight();
@@ -1845,6 +1918,38 @@ async function exportRangeReportPdf() {
   }
 }
 document.getElementById('rrExportBtn').addEventListener('click', exportRangeReportPdf);
+
+async function exportRangeReportJpg() {
+  if (!lastRangeReport || !document.getElementById('rrContent').querySelector('.rr-summary-row, .rr-detail-row')) {
+    showToast('โหลดรายงานก่อน แล้วค่อย Export JPG');
+    return;
+  }
+  if (!window.html2canvas) {
+    showToast('โหลดตัวสร้างรูปไม่สำเร็จ ลองใหม่ (ต้องต่ออินเทอร์เน็ต)');
+    return;
+  }
+  const btn = document.getElementById('rrExportJpgBtn');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'กำลังสร้าง JPG...';
+  try {
+    const canvas = await renderReportSheetToCanvas();
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } catch (e) {
+    console.warn('jpg export failed', e);
+    showToast('สร้าง JPG ไม่สำเร็จ ลองใหม่อีกครั้ง');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+document.getElementById('rrExportJpgBtn').addEventListener('click', exportRangeReportJpg);
 
 /* ---------- Static icon slots ---------- */
 document.getElementById('searchIcon').innerHTML = ICONS.search();
@@ -2104,7 +2209,7 @@ function adjustStock(id, loc, delta, staffName) {
   touch(it);
   saveItems(items);
   const nameLabel = staffName ? ` · โดย ${staffName}` : '';
-  const entry = { id: uid(), itemId: id, name: `${it.name} (${locLabel})${nameLabel}`, delta, qtyAfter: it[key], time: new Date().toISOString(), staffName: staffName || null };
+  const entry = { id: uid(), itemId: id, name: `${it.name} (${locLabel})${nameLabel}`, delta, qtyAfter: it[key], time: new Date().toISOString(), staffName: staffName || null, kind: 'adjust' };
   log.unshift(entry);
   saveLog(log);
   archiveActivity(entry, it);
@@ -2800,7 +2905,7 @@ document.getElementById('transferSaveBtn').addEventListener('click', () => {
   touch(it);
   saveItems(items);
 
-  const entry = { id: uid(), itemId: it.id, name: `${it.name} (ย้าย ${fromLabel}→${toLabel})`, delta: qty, qtyAfter: it[toKey], time: new Date().toISOString() };
+  const entry = { id: uid(), itemId: it.id, name: `${it.name} (ย้าย ${fromLabel}→${toLabel})`, delta: qty, qtyAfter: it[toKey], time: new Date().toISOString(), kind: 'transfer' };
   log.unshift(entry);
   saveLog(log);
   archiveActivity(entry, it);
