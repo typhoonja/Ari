@@ -1038,6 +1038,13 @@ const REPORT_ITEMS = [
   "ผง Tsuyuhikari 30g for drinks",
 ];
 
+// Set to true only in the instant loadItems() below seeds a brand-new
+// starter list (i.e. this device/browser had never held data before).
+// applyCloudSnapshot()/pushToCloud() check this once, right after, so a
+// freshly-seeded local list never gets unioned into an already-existing
+// cloud copy by id (that mismatch — new ids, same names — is what used to
+// pile up duplicate items every time the app opened on a "blank" device).
+let justSeededDefaults = false;
 function loadItems() {
   let arr;
   const raw = localStorage.getItem(ITEMS_KEY);
@@ -1053,6 +1060,7 @@ function loadItems() {
     }));
     localStorage.setItem(SEEDED_KEY, 'true');
     localStorage.setItem(ITEMS_KEY, JSON.stringify(arr));
+    justSeededDefaults = true;
   } else {
     try { arr = JSON.parse(raw) || []; } catch(e){ arr = []; }
   }
@@ -1262,8 +1270,14 @@ function applyCloudSnapshot(data) {
   // next snapshot — which still reflects the old server state — would wipe
   // the new item back out of localStorage.
   if (Array.isArray(data.items)) {
-    items = mergeCollection(items, data.items, loadTombstones(DELETED_ITEM_IDS_KEY));
+    // A locally just-seeded starter list (new ids, same names as whatever's
+    // already on the server) must not be unioned in by id — that's exactly
+    // what used to create piles of duplicate items. Drop it and adopt the
+    // server's copy outright; it's only kept when the cloud has nothing yet.
+    const localBase = (justSeededDefaults && data.items.length > 0) ? [] : items;
+    items = mergeCollection(localBase, data.items, loadTombstones(DELETED_ITEM_IDS_KEY));
     localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
+    justSeededDefaults = false;
   }
   if (Array.isArray(data.log)) { log = mergeLog(log, data.log); localStorage.setItem(LOG_KEY, JSON.stringify(log)); }
   if (Array.isArray(data.staffList)) {
@@ -1308,7 +1322,9 @@ async function pushToCloud() {
     // Adopt the merged result locally too, so this device immediately sees
     // anything the other device had that we didn't — no waiting on the
     // realtime listener to bounce it back to us.
-    items = mergeCollection(items, serverData.items, mergedDeletedItems);
+    const localItemsBase = (justSeededDefaults && Array.isArray(serverData.items) && serverData.items.length > 0) ? [] : items;
+    items = mergeCollection(localItemsBase, serverData.items, mergedDeletedItems);
+    justSeededDefaults = false;
     staffList = mergeCollection(staffList, serverData.staffList, mergedDeletedStaff);
     customGroups = mergeCollection(customGroups, serverData.customGroups, mergedDeletedGroups);
     log = mergeLog(log, serverData.log);
@@ -1366,6 +1382,7 @@ function initCloudSync() {
         backfillActivityIfNeeded(snap.data() || {});
         dedupeActivityArchiveIfNeeded(snap.data() || {});
         reclassifyCategoriesIfNeeded(snap.data() || {});
+        dedupeItemsIfNeeded(snap.data() || {});
       } else {
         // very first time ever: no shared data yet, push what we have (seeded defaults) so it becomes the shared copy
         pushToCloud();
@@ -1478,6 +1495,57 @@ function reclassifyCategoriesIfNeeded(cloudData) {
   cloudDocRef.set({ items, categoriesReclassifiedV2: true }, { merge: true })
     .then(() => render())
     .catch(err => console.warn('category reclassify failed', err));
+}
+
+/* One-time cleanup for the mass-duplicate bug (2026-09): opening the app on
+   a browser/device that had never held data (cache cleared, private tab, new
+   device, reinstalled home-screen icon) reseeded the full starter item list
+   with brand-new ids before the real cloud copy arrived, and since merges
+   only matched by id, those reseeded copies piled up instead of being
+   recognized as duplicates. This groups the shared items by normalized name,
+   folds every duplicate's quantities/supplier info into one record, and
+   tombstones the rest so they can't reappear from another device's stale copy. */
+let itemDedupeDone = false;
+function normalizeItemName(name) { return (name || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+function dedupeItemsIfNeeded(cloudData) {
+  if (itemDedupeDone || cloudData.itemsDedupedV1 || !Array.isArray(cloudData.items)) return;
+  itemDedupeDone = true;
+  const groups = new Map();
+  cloudData.items.forEach(it => {
+    if (!it || !it.id) return;
+    const key = normalizeItemName(it.name);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(it);
+  });
+  const merged = [];
+  const removedIds = [];
+  groups.forEach(group => {
+    if (group.length === 1) { merged.push(group[0]); return; }
+    // keep the oldest record as the canonical one; fold every duplicate's
+    // quantities and any filled-in supplier info into it so nothing is lost
+    group.sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+    const keep = { ...group[0] };
+    keep.qtyFront = group.reduce((sum, it) => sum + (it.qtyFront || 0), 0);
+    keep.qtyBack = group.reduce((sum, it) => sum + (it.qtyBack || 0), 0);
+    keep.minQty = Math.max(...group.map(it => it.minQty || 0));
+    ['supplierName', 'supplierPhone', 'supplierLine', 'supplierLink'].forEach(f => {
+      if (!keep[f]) { const withVal = group.find(it => it[f]); if (withVal) keep[f] = withVal[f]; }
+    });
+    touch(keep);
+    merged.push(keep);
+    group.slice(1).forEach(it => removedIds.push(it.id));
+  });
+  if (removedIds.length === 0) {
+    cloudDocRef.set({ itemsDedupedV1: true }, { merge: true });
+    return;
+  }
+  const tombstones = pruneTombstones([...loadTombstones(DELETED_ITEM_IDS_KEY), ...removedIds.map(id => ({ id, deletedAt: Date.now() }))]);
+  localStorage.setItem(DELETED_ITEM_IDS_KEY, JSON.stringify(tombstones));
+  items = merged;
+  localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
+  cloudDocRef.set({ items: merged, deletedItemIds: tombstones, itemsDedupedV1: true }, { merge: true })
+    .then(() => { console.warn(`removed ${removedIds.length} duplicate item(s)`); render(); })
+    .catch(err => { console.warn('item dedupe failed', err); itemDedupeDone = false; });
 }
 
 /* ---------- Date-range report ---------- */
@@ -1895,6 +1963,7 @@ async function exportRangeReportPdf() {
   try {
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+    const filename = `matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.pdf`;
     try {
       await buildFormalRangeReportPdf(doc);
     } catch (fontErr) {
@@ -1903,12 +1972,18 @@ async function exportRangeReportPdf() {
       // start over on a clean document in case the failed attempt left partial content
       const doc2 = new jsPDF({ unit: 'pt', format: 'a4' });
       await buildScreenshotRangeReportPdf(doc2);
-      doc2.save(`matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.pdf`);
+      // doc.save() drives a hidden, programmatically-clicked link — reliable
+      // right after a tap, but this only fires after an await (font/image
+      // load), by which point mobile Safari no longer treats it as a real
+      // user gesture and silently drops the download. Showing a real,
+      // on-screen link the user taps themselves (same fix as JPG export)
+      // works across browsers instead.
+      showPdfPreview(doc2.output('datauristring'), filename);
       btn.disabled = false;
       btn.textContent = prevLabel;
       return;
     }
-    doc.save(`matcha-report-${lastRangeReport.fromStr}-to-${lastRangeReport.toStr}.pdf`);
+    showPdfPreview(doc.output('datauristring'), filename);
   } catch (e) {
     console.warn('pdf export failed', e);
     showToast('สร้าง PDF ไม่สำเร็จ ลองใหม่อีกครั้ง');
@@ -1951,6 +2026,21 @@ document.getElementById('rrExportJpgBtn').addEventListener('click', exportRangeR
    clicked programmatically after an await — by then it's no longer tied
    to the original tap and mobile Safari silently drops it. Showing the
    image also lets anyone save it the universal way: press and hold. */
+function showPdfPreview(dataUrl, filename) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed; inset:0; background:rgba(20,18,15,.9); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; overflow:auto; padding:24px 16px 40px;';
+  overlay.innerHTML = `
+    <div style="color:#fff; font-size:14px; margin-bottom:18px; text-align:center; max-width:480px; line-height:1.5;">
+      สร้าง PDF เสร็จแล้ว แตะปุ่ม "ดาวน์โหลด PDF" ด้านล่างเพื่อบันทึกลงเครื่อง
+    </div>
+    <div style="display:flex; gap:10px;">
+      <a href="${dataUrl}" download="${filename}" style="background:#fff; color:#181511; padding:14px 26px; border-radius:8px; font-weight:600; text-decoration:none; font-size:15px;">ดาวน์โหลด PDF</a>
+      <button id="pdfPreviewCloseBtn" style="background:transparent; color:#fff; border:1px solid #fff; padding:14px 26px; border-radius:8px; font-weight:600; font-size:15px;">ปิด</button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#pdfPreviewCloseBtn').addEventListener('click', () => overlay.remove());
+}
 function showJpgPreview(dataUrl, filename) {
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed; inset:0; background:rgba(20,18,15,.9); z-index:9999; display:flex; flex-direction:column; align-items:center; overflow:auto; padding:24px 16px 40px;';
