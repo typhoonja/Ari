@@ -1497,19 +1497,25 @@ function reclassifyCategoriesIfNeeded(cloudData) {
     .catch(err => console.warn('category reclassify failed', err));
 }
 
-/* One-time cleanup for the mass-duplicate bug (2026-09): opening the app on
-   a browser/device that had never held data (cache cleared, private tab, new
+/* Cleanup for the mass-duplicate bug (2026-09): opening the app on a
+   browser/device that had never held data (cache cleared, private tab, new
    device, reinstalled home-screen icon) reseeded the full starter item list
    with brand-new ids before the real cloud copy arrived, and since merges
    only matched by id, those reseeded copies piled up instead of being
    recognized as duplicates. This groups the shared items by normalized name,
    folds every duplicate's quantities/supplier info into one record, and
-   tombstones the rest so they can't reappear from another device's stale copy. */
-let itemDedupeDone = false;
+   tombstones the rest so they can't reappear from another device's stale copy.
+   This used to be gated by a permanent "itemsDedupedV1" flag on the cloud
+   doc so it only ever ran once — but a device stuck on an old cached copy of
+   this page (common with "Add to Home Screen" tabs that don't auto-refresh)
+   can still reseed and push fresh duplicates at any time, and once the flag
+   was set they could never be cleaned again. So this now re-checks on every
+   snapshot and only touches the cloud when it actually finds duplicates,
+   making it self-healing instead of one-shot. */
+let itemDedupeInFlight = false;
 function normalizeItemName(name) { return (name || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
 function dedupeItemsIfNeeded(cloudData) {
-  if (itemDedupeDone || cloudData.itemsDedupedV1 || !Array.isArray(cloudData.items)) return;
-  itemDedupeDone = true;
+  if (itemDedupeInFlight || !Array.isArray(cloudData.items)) return;
   const groups = new Map();
   cloudData.items.forEach(it => {
     if (!it || !it.id) return;
@@ -1535,17 +1541,16 @@ function dedupeItemsIfNeeded(cloudData) {
     merged.push(keep);
     group.slice(1).forEach(it => removedIds.push(it.id));
   });
-  if (removedIds.length === 0) {
-    cloudDocRef.set({ itemsDedupedV1: true }, { merge: true });
-    return;
-  }
+  if (removedIds.length === 0) return; // nothing duplicated right now — leave the cloud doc untouched
+  itemDedupeInFlight = true;
   const tombstones = pruneTombstones([...loadTombstones(DELETED_ITEM_IDS_KEY), ...removedIds.map(id => ({ id, deletedAt: Date.now() }))]);
   localStorage.setItem(DELETED_ITEM_IDS_KEY, JSON.stringify(tombstones));
   items = merged;
   localStorage.setItem(ITEMS_KEY, JSON.stringify(items));
-  cloudDocRef.set({ items: merged, deletedItemIds: tombstones, itemsDedupedV1: true }, { merge: true })
+  cloudDocRef.set({ items: merged, deletedItemIds: tombstones }, { merge: true })
     .then(() => { console.warn(`removed ${removedIds.length} duplicate item(s)`); render(); })
-    .catch(err => { console.warn('item dedupe failed', err); itemDedupeDone = false; });
+    .catch(err => { console.warn('item dedupe failed', err); })
+    .finally(() => { itemDedupeInFlight = false; });
 }
 
 /* ---------- Date-range report ---------- */
@@ -1978,12 +1983,18 @@ async function exportRangeReportPdf() {
       // user gesture and silently drops the download. Showing a real,
       // on-screen link the user taps themselves (same fix as JPG export)
       // works across browsers instead.
-      showPdfPreview(doc2.output('datauristring'), filename);
+      const thumb2 = (await renderReportSheetToCanvas()).toDataURL('image/jpeg', 0.85);
+      showPdfPreview(doc2.output('datauristring'), filename, thumb2);
       btn.disabled = false;
       btn.textContent = prevLabel;
       return;
     }
-    showPdfPreview(doc.output('datauristring'), filename);
+    // The formal PDF has selectable text, not an image, so there's nothing
+    // to preview inside the PDF itself — render the same on-screen report
+    // to a thumbnail image (like Export JPG does) purely so the person can
+    // see at a glance that the right report got generated before saving it.
+    const thumb = (await renderReportSheetToCanvas()).toDataURL('image/jpeg', 0.85);
+    showPdfPreview(doc.output('datauristring'), filename, thumb);
   } catch (e) {
     console.warn('pdf export failed', e);
     showToast('สร้าง PDF ไม่สำเร็จ ลองใหม่อีกครั้ง');
@@ -2026,13 +2037,14 @@ document.getElementById('rrExportJpgBtn').addEventListener('click', exportRangeR
    clicked programmatically after an await — by then it's no longer tied
    to the original tap and mobile Safari silently drops it. Showing the
    image also lets anyone save it the universal way: press and hold. */
-function showPdfPreview(dataUrl, filename) {
+function showPdfPreview(dataUrl, filename, thumbUrl) {
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed; inset:0; background:rgba(20,18,15,.9); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; overflow:auto; padding:24px 16px 40px;';
   overlay.innerHTML = `
     <div style="color:#fff; font-size:14px; margin-bottom:18px; text-align:center; max-width:480px; line-height:1.5;">
       สร้าง PDF เสร็จแล้ว แตะปุ่ม "ดาวน์โหลด PDF" ด้านล่างเพื่อบันทึกลงเครื่อง
     </div>
+    ${thumbUrl ? `<img src="${thumbUrl}" style="max-width:100%; max-height:60vh; border-radius:8px; box-shadow:0 4px 24px rgba(0,0,0,.4); margin-bottom:18px;" />` : ''}
     <div style="display:flex; gap:10px;">
       <a href="${dataUrl}" download="${filename}" style="background:#fff; color:#181511; padding:14px 26px; border-radius:8px; font-weight:600; text-decoration:none; font-size:15px;">ดาวน์โหลด PDF</a>
       <button id="pdfPreviewCloseBtn" style="background:transparent; color:#fff; border:1px solid #fff; padding:14px 26px; border-radius:8px; font-weight:600; font-size:15px;">ปิด</button>
